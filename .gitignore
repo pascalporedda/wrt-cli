@@ -1,3 +1,6 @@
 /target/
 meta/
 CONTINUITY.md
+.worktrees/
+.wrt.env
+.wrt.json
