@@ -1,0 +1,23 @@
+You are generating a repo-local configuration file for a developer tool called "wrt".
+
+Goal: enable parallel git worktrees for agentic coding by providing:
+- package manager install command
+- services/dev commands and how to offset ports to avoid collisions
+- whether Supabase local dev is used, and its base ports (from supabase/config.toml if present)
+
+Instructions:
+- Inspect files in the current repo.
+- Prefer explicit data from config files over guesses.
+- Use WRT_PORT_OFFSET (integer) as the offset to add to base ports.
+- Emit ONLY valid JSON matching the provided JSON Schema.
+- IMPORTANT: Do not omit object fields. If a field is unknown/unset, use null.
+
+Output guidance:
+- version: 1
+- port_block_size: 100
+- package_manager: best detected ("unknown" if unclear)
+- services: include major apps/services with their dev command as argv array
+- supabase.detected: true only if supabase/config.toml exists
+- supabase.config_path: "supabase/config.toml" if detected, otherwise null
+- supabase.start_command: ["supabase","start"] if detected, otherwise null
+- supabase.base_ports: include any known ports (null for unknown ports; null for the whole object if not detected)

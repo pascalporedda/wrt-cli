@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "wrt discovery output",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "port_block_size",
+    "package_manager",
+    "services",
+    "supabase",
+    "notes"
+  ],
+  "properties": {
+    "version": { "type": "integer", "minimum": 1 },
+    "port_block_size": { "type": "integer", "minimum": 1 },
+    "package_manager": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "install_command", "notes"],
+      "properties": {
+        "name": { "type": "string", "enum": ["pnpm", "npm", "yarn", "bun", "unknown"] },
+        "install_command": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "notes": { "type": ["string", "null"] }
+      }
+    },
+    "services": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "kind",
+          "dev_command",
+          "base_port",
+          "port_env",
+          "url_env",
+          "notes"
+        ],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "kind": { "type": ["string", "null"] },
+          "dev_command": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "base_port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+          "port_env": { "type": ["string", "null"] },
+          "url_env": { "type": ["string", "null"] },
+          "notes": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "supabase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["detected", "config_path", "start_command", "base_ports", "notes"],
+      "properties": {
+        "detected": { "type": "boolean" },
+        "config_path": { "type": ["string", "null"] },
+        "start_command": {
+          "type": ["array", "null"],
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "base_ports": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["api", "db", "shadow_db", "studio", "inbucket"],
+          "properties": {
+            "api": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+            "db": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+            "shadow_db": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+            "studio": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+            "inbucket": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 }
+          }
+        },
+        "notes": { "type": ["string", "null"] }
+      }
+    },
+    "notes": { "type": ["string", "null"] }
+  }
+}
