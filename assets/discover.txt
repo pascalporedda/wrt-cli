@@ -4,6 +4,7 @@ Goal: enable parallel git worktrees for agentic coding by providing:
 - package manager install command
 - services/dev commands and how to offset ports to avoid collisions
 - whether Supabase local dev is used, and its base ports (from supabase/config.toml if present)
+- database tooling info: whether the repo has DB migrations/seeding and how to run migrate/seed/reset
 
 Instructions:
 - Inspect files in the current repo.
@@ -17,6 +18,27 @@ Output guidance:
 - port_block_size: 100
 - package_manager: best detected ("unknown" if unclear)
 - services: include major apps/services with their dev command as argv array
+- database: detect DB tooling and provide commands (argv arrays) for migrate/seed/reset if the repo has them
+  - Only support these tooling kinds: supabase, prisma, sqlx. If unclear, set database.kind to "unknown" or null.
+  - Prefer providing a reset command when possible (reset is the best "one-shot" local setup).
+  - Supabase:
+    - Detect via `supabase/` and/or `supabase/config.toml`.
+    - Set database.kind="supabase".
+    - reset_command: ["supabase","db","reset"] (preferred).
+    - migrate_command/seed_command: optional; can be null if reset covers it.
+  - Prisma:
+    - Detect via `prisma/schema.prisma` (or schema.prisma).
+    - Set database.kind="prisma".
+    - Prefer package.json scripts if present (db:reset/db:seed/db:migrate). If no scripts, use npx:
+      - reset_command: ["npx","prisma","migrate","reset"] (destructive).
+      - migrate_command: ["npx","prisma","migrate","dev"] (may be interactive; use scripts if available).
+      - seed_command: ["npx","prisma","db","seed"] (if configured).
+  - SQLx (Rust):
+    - Detect via Cargo.toml containing "sqlx" and/or `sqlx-data.json` and/or `migrations/`.
+    - Set database.kind="sqlx".
+    - migrate_command: ["cargo","sqlx","migrate","run"] (if migrations exist).
+    - reset_command: often not available; set null unless the repo defines a clear reset script/command.
+    - seed_command: set null unless the repo has an explicit seed script.
 - supabase.detected: true only if supabase/config.toml exists
 - supabase.config_path: "supabase/config.toml" if detected, otherwise null
 - supabase.start_command: ["supabase","start"] if detected, otherwise null

@@ -8,6 +8,7 @@
     "port_block_size",
     "package_manager",
     "services",
+    "database",
     "supabase",
     "notes"
   ],
@@ -55,6 +56,41 @@
           "url_env": { "type": ["string", "null"] },
           "notes": { "type": ["string", "null"] }
         }
+      }
+    },
+    "database": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "detected",
+        "kind",
+        "migrate_command",
+        "seed_command",
+        "reset_command",
+        "notes"
+      ],
+      "properties": {
+        "detected": { "type": "boolean" },
+        "kind": {
+          "type": ["string", "null"],
+          "enum": ["supabase", "prisma", "sqlx", "unknown", null]
+        },
+        "migrate_command": {
+          "type": ["array", "null"],
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "seed_command": {
+          "type": ["array", "null"],
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "reset_command": {
+          "type": ["array", "null"],
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "notes": { "type": ["string", "null"] }
       }
     },
     "supabase": {

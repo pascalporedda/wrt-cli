@@ -16,6 +16,9 @@ pub struct Discovery {
     #[serde(default)]
     pub services: Vec<Service>,
 
+    #[serde(default)]
+    pub database: Database,
+
     pub supabase: Supabase,
 
     #[serde(default)]
@@ -55,6 +58,21 @@ pub struct Supabase {
     pub start_command: Option<Vec<String>>,
     #[serde(default)]
     pub base_ports: Option<BasePorts>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct Database {
+    pub detected: bool,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub migrate_command: Option<Vec<String>>,
+    #[serde(default)]
+    pub seed_command: Option<Vec<String>>,
+    #[serde(default)]
+    pub reset_command: Option<Vec<String>>,
     #[serde(default)]
     pub notes: Option<String>,
 }

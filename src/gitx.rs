@@ -15,14 +15,25 @@ pub fn detect_repo(cwd: &Path) -> Result<Repo> {
     let common = git_out(cwd, ["rev-parse", "--git-common-dir"])
         .context("git rev-parse --git-common-dir")?;
 
-    let root = PathBuf::from(root.trim());
+    let workdir_root = PathBuf::from(root.trim());
     let mut common_dir = PathBuf::from(common.trim());
     if common_dir.as_os_str().is_empty() {
         return Err(anyhow!("empty --git-common-dir"));
     }
     if !common_dir.is_absolute() {
-        common_dir = root.join(common_dir);
+        common_dir = workdir_root.join(common_dir);
     }
+
+    // When invoked from inside a git worktree, `--show-toplevel` points at the worktree root,
+    // but wrt's runtime artifacts and config live at the main workdir root (parent of the common
+    // git dir, typically `<repo>/.git`).
+    let root = match common_dir.file_name().and_then(|s| s.to_str()) {
+        Some(".git") => common_dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or(workdir_root),
+        _ => workdir_root,
+    };
 
     Ok(Repo { root, common_dir })
 }

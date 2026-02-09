@@ -2,11 +2,13 @@ use anyhow::{Context, Result};
 use chrono::SecondsFormat;
 use clap::{Parser, Subcommand};
 use std::env;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::{fs, io::Write};
 
 mod codex;
+mod db;
 mod gitx;
 mod pm;
 mod state;
@@ -18,7 +20,8 @@ const USAGE_TEXT: &str = r#"wrt: git worktree helper geared for parallel (agenti
 
 Usage:
   wrt init [--force] [--print] [--model <codex-model>]
-  wrt new <name> [--from <ref>] [--branch <branch>] [--install auto|true|false] [--supabase auto|true|false]
+  wrt new <name> [--from <ref>] [--branch <branch>] [--install auto|true|false] [--supabase auto|true|false] [--db auto|true|false]
+  wrt db [<name>] reset|seed|migrate [--print]
   wrt ls
   wrt path <name>
   wrt env [<name>]
@@ -30,6 +33,7 @@ Conventions:
   - Worktrees live under: <repo>/.worktrees/<name>
   - Each worktree gets a reserved "port block" (offset = block*100); block 0 is kept for the main workdir.
   - If a Supabase config exists (supabase/config.toml), wrt can patch it to avoid port/container collisions.
+  - If DB reset/seed commands are discovered (via .wrt.json), wrt can optionally run them after setup.
 "#;
 
 #[derive(Parser, Debug)]
@@ -67,6 +71,20 @@ enum Cmd {
         install: String,
         #[arg(long, default_value = "auto")]
         supabase: String,
+        #[arg(long, default_value = "auto")]
+        db: String,
+    },
+
+    /// Run database utilities for a worktree (reset/seed/migrate)
+    Db {
+        /// Worktree name (optional if run from inside a worktree directory)
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+        /// Explicit worktree name (useful if the name conflicts with a subcommand like "reset")
+        #[arg(long, value_name = "NAME")]
+        worktree: Option<String>,
+        #[command(subcommand)]
+        action: DbAction,
     },
 
     /// List tracked worktrees
@@ -107,6 +125,31 @@ enum Cmd {
         name: String,
         #[arg(required = true, value_name = "COMMAND", num_args = 1.., allow_hyphen_values = true)]
         command: Vec<String>,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum DbAction {
+    /// Reset the local database (destructive)
+    Reset {
+        /// Skip interactive prompts (required in non-interactive contexts)
+        #[arg(long)]
+        yes: bool,
+        /// Print the command that would be run and exit
+        #[arg(long)]
+        print: bool,
+    },
+    /// Seed the local database
+    Seed {
+        /// Print the command that would be run and exit
+        #[arg(long)]
+        print: bool,
+    },
+    /// Run migrations
+    Migrate {
+        /// Print the command that would be run and exit
+        #[arg(long)]
+        print: bool,
     },
 }
 
@@ -171,6 +214,7 @@ fn run() -> Result<i32> {
             branch,
             install,
             supabase,
+            db,
         } => {
             let opts = NewOpts {
                 name: &name,
@@ -178,9 +222,22 @@ fn run() -> Result<i32> {
                 branch: branch.as_deref(),
                 install_mode: &install,
                 sb_mode: &supabase,
+                db_mode: &db,
             };
             cmd_new(&log, &repo, &mut st, opts)
         }
+        Cmd::Db {
+            name,
+            worktree,
+            action,
+        } => cmd_db(
+            &log,
+            &repo,
+            &st,
+            name.as_deref(),
+            worktree.as_deref(),
+            action,
+        ),
         Cmd::Ls | Cmd::List => cmd_ls(&st),
         Cmd::Path { name } => cmd_path(&log, &st, &name),
         Cmd::Env { name } => cmd_env(&log, &st, name.as_deref()),
@@ -275,6 +332,7 @@ struct NewOpts<'a> {
     branch: Option<&'a str>,
     install_mode: &'a str,
     sb_mode: &'a str,
+    db_mode: &'a str,
 }
 
 fn cmd_new(
@@ -344,6 +402,7 @@ fn cmd_new(
 
     let sb = opts.sb_mode.trim().to_lowercase();
     let install = opts.install_mode.trim().to_lowercase();
+    let db_mode = opts.db_mode.trim().to_lowercase();
 
     if sb == "true" || (sb == "auto" && supabase::has_config(&wt_path)) {
         log.infof("supabase detected: patching config for isolation (project_id + ports)");
@@ -374,16 +433,271 @@ fn cmd_new(
     if sb == "true" || (sb == "auto" && supabase::has_config(&wt_path)) {
         if which("supabase").is_none() {
             log.infof("supabase CLI not found; skipping `supabase start` (config patched)");
-            return Ok(0);
+        } else {
+            log.infof("supabase start (isolated ports, project_id suffix)");
+            if let Err(e) = run_cmd(&wt_path, "supabase", &["start"]) {
+                log.errorf(&format!("supabase start failed: {e}"));
+                return Ok(1);
+            }
         }
-        log.infof("supabase start (isolated ports, project_id suffix)");
-        if let Err(e) = run_cmd(&wt_path, "supabase", &["start"]) {
-            log.errorf(&format!("supabase start failed: {e}"));
+    }
+
+    if db_mode != "false" {
+        if let Err(e) = maybe_run_db_setup(log, repo, &alloc, &wt_path, &db_mode) {
+            log.errorf(&format!("db setup failed: {e}"));
             return Ok(1);
         }
     }
 
     Ok(0)
+}
+
+fn cmd_db(
+    log: &ui::Logger,
+    repo: &gitx::Repo,
+    st: &state::State,
+    name: Option<&str>,
+    worktree: Option<&str>,
+    action: DbAction,
+) -> Result<i32> {
+    let mut resolved = worktree
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| name.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+
+    if resolved.is_none() {
+        resolved = infer_worktree_from_cwd(st);
+    }
+
+    let Some(resolved) = resolved else {
+        log.errorf("missing <name> (or run inside a worktree)");
+        return Ok(2);
+    };
+
+    let key = worktree::slug(&resolved);
+    let Some(a) = st.allocations.get(&key) else {
+        log.errorf(&format!("unknown worktree: \"{key}\""));
+        return Ok(2);
+    };
+
+    let wt_path = PathBuf::from(&a.path);
+    let cfg_path = repo.root.join(".wrt.json");
+
+    let mut kind_hint: Option<String> = None;
+    let mut cmd: Option<Vec<String>> = None;
+    let (op, yes, print) = match action {
+        DbAction::Reset { yes, print } => ("reset", yes, print),
+        DbAction::Seed { print } => ("seed", false, print),
+        DbAction::Migrate { print } => ("migrate", false, print),
+    };
+
+    if cfg_path.exists() {
+        if let Ok(s) = fs::read_to_string(&cfg_path) {
+            if let Ok(d) = serde_json::from_str::<codex::Discovery>(&s) {
+                if d.database.detected {
+                    kind_hint = d.database.kind.clone();
+                }
+                cmd = match op {
+                    "reset" => d.database.reset_command.clone(),
+                    "seed" => d.database.seed_command.clone(),
+                    "migrate" => d.database.migrate_command.clone(),
+                    _ => None,
+                };
+            } else {
+                log.infof("could not parse .wrt.json; skipping DB setup from config");
+            }
+        }
+    }
+
+    // Minimal fallback for Supabase reset if no .wrt.json exists yet.
+    if cmd.is_none() && op == "reset" && db::has_supabase_seed_or_migrations(&wt_path) {
+        kind_hint = kind_hint.or(Some("supabase".into()));
+        cmd = Some(vec!["supabase".into(), "db".into(), "reset".into()]);
+    }
+
+    let Some(argv) = cmd else {
+        let label = kind_hint.as_deref().unwrap_or("database");
+        log.errorf(&format!(
+            "{label}: no {op} command known; run `wrt init` to generate .wrt.json"
+        ));
+        return Ok(2);
+    };
+    if argv.is_empty() {
+        return Ok(0);
+    }
+
+    let label = kind_hint.as_deref().unwrap_or("database");
+    let cmd_str = argv.join(" ");
+
+    if print {
+        println!("{cmd_str}");
+        return Ok(0);
+    }
+
+    if op == "reset" {
+        if yes {
+            // ok
+        } else if !std::io::stdin().is_terminal() {
+            log.errorf(&format!(
+                "{label}: refusing to run reset non-interactively; pass `--yes` to confirm"
+            ));
+            return Ok(2);
+        } else if !confirm(&format!(
+            "{label}: run DB reset now? This may delete local data. [{cmd_str}] (y/N): "
+        ))? {
+            log.infof(&format!("{label}: skipping reset"));
+            return Ok(0);
+        }
+    }
+
+    log.infof(&format!("{label}: running: {cmd_str}"));
+    if let Err(e) = run_argv_with_wrt_env(&wt_path, a, &argv) {
+        log.errorf(&format!("{label}: command failed: {e}"));
+        return Ok(1);
+    }
+    Ok(0)
+}
+
+fn infer_worktree_from_cwd(st: &state::State) -> Option<String> {
+    let wd = env::current_dir().ok()?;
+    for a in st.allocations.values() {
+        let ap = PathBuf::from(&a.path);
+        if wd.strip_prefix(&ap).is_ok() {
+            return Some(a.name.clone());
+        }
+    }
+    None
+}
+
+fn maybe_run_db_setup(
+    log: &ui::Logger,
+    repo: &gitx::Repo,
+    alloc: &state::Allocation,
+    wt_path: &Path,
+    db_mode: &str,
+) -> Result<()> {
+    let mut kind_hint: Option<String> = None;
+    let mut reset_cmd: Option<Vec<String>> = None;
+
+    // Prefer explicit repo config (wrt init).
+    let cfg_path = repo.root.join(".wrt.json");
+    if cfg_path.exists() {
+        if let Ok(s) = fs::read_to_string(&cfg_path) {
+            if let Ok(d) = serde_json::from_str::<codex::Discovery>(&s) {
+                if d.database.detected {
+                    kind_hint = d.database.kind.clone();
+                }
+                // For `wrt new --db ...`, only ever run a reset command. Seed/migrate are explicit
+                // operations via `wrt db ...`.
+                reset_cmd = d.database.reset_command.clone();
+            } else {
+                log.infof("could not parse .wrt.json; skipping DB setup from config");
+            }
+        }
+    }
+
+    // Fallback heuristic for common Supabase repos without .wrt.json.
+    if reset_cmd.is_none() && db::has_supabase_seed_or_migrations(wt_path) {
+        kind_hint = kind_hint.or(Some("supabase".into()));
+        reset_cmd = Some(vec!["supabase".into(), "db".into(), "reset".into()]);
+    }
+
+    // If we still have no actionable command, keep it non-fatal.
+    let Some(argv) = reset_cmd else {
+        let mut hints: Vec<&str> = Vec::new();
+        if db::has_prisma_schema(wt_path) {
+            hints.push("prisma");
+        }
+        if db::has_sqlx_markers(wt_path) {
+            hints.push("sqlx");
+        }
+        if !hints.is_empty() {
+            log.infof(&format!(
+                "db tooling detected ({}) but no reset command known; run `wrt init` to generate .wrt.json or use `wrt db <name> seed|migrate`",
+                hints.join(", ")
+            ));
+        }
+        return Ok(());
+    };
+
+    if argv.is_empty() {
+        return Ok(());
+    }
+
+    let label = kind_hint.as_deref().unwrap_or("database");
+    let cmd_str = argv.join(" ");
+
+    match db_mode {
+        "true" => {
+            log.infof(&format!("{label}: running db setup: {cmd_str}"));
+            run_argv_with_wrt_env(wt_path, alloc, &argv)?;
+        }
+        "auto" => {
+            if !std::io::stdin().is_terminal() {
+                log.infof(&format!(
+                    "{label}: db setup available ({cmd_str}) but skipping in non-interactive mode; rerun with `--db true` to run"
+                ));
+                return Ok(());
+            }
+
+            if !confirm(&format!(
+                "{label}: run DB reset/seed now? This may delete local data. [{cmd_str}] (y/N): "
+            ))? {
+                log.infof(&format!("{label}: skipping db setup"));
+                return Ok(());
+            }
+
+            log.infof(&format!("{label}: running db setup: {cmd_str}"));
+            run_argv_with_wrt_env(wt_path, alloc, &argv)?;
+        }
+        "false" => {}
+        _ => {
+            log.infof("invalid --db value (expected auto|true|false); skipping db setup");
+        }
+    }
+
+    Ok(())
+}
+
+fn run_argv_with_wrt_env(dir: &Path, a: &state::Allocation, argv: &[String]) -> Result<()> {
+    let cmd = &argv[0];
+    let cmd_args = &argv[1..];
+
+    let mut envs: Vec<(String, String)> = env::vars().collect();
+    envs.push(("WRT_NAME".into(), a.name.clone()));
+    envs.push(("WRT_BRANCH".into(), a.branch.clone()));
+    envs.push(("WRT_PORT_BLOCK".into(), a.block.to_string()));
+    envs.push(("WRT_PORT_OFFSET".into(), a.offset.to_string()));
+
+    let mut c = Command::new(cmd);
+    c.args(cmd_args)
+        .current_dir(dir)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .stdin(Stdio::inherit());
+
+    c.env_clear();
+    for (k, v) in envs {
+        c.env(k, v);
+    }
+
+    let status = c.status().with_context(|| format!("run {cmd}"))?;
+    if !status.success() {
+        return Err(anyhow::anyhow!("command failed"));
+    }
+    Ok(())
+}
+
+fn confirm(prompt: &str) -> Result<bool> {
+    use std::io::{self, Write};
+
+    eprint!("{prompt}");
+    io::stderr().flush().ok();
+
+    let mut s = String::new();
+    io::stdin().read_line(&mut s).context("read user input")?;
+    let ans = s.trim().to_lowercase();
+    Ok(ans == "y" || ans == "yes")
 }
 
 fn cmd_ls(st: &state::State) -> Result<i32> {
@@ -421,15 +735,7 @@ fn cmd_env(log: &ui::Logger, st: &state::State, name: Option<&str>) -> Result<i3
     let mut name = name.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
 
     if name.is_none() {
-        if let Ok(wd) = env::current_dir() {
-            for a in st.allocations.values() {
-                let ap = PathBuf::from(&a.path);
-                if wd.strip_prefix(&ap).is_ok() {
-                    name = Some(a.name.clone());
-                    break;
-                }
-            }
-        }
+        name = infer_worktree_from_cwd(st);
     }
 
     let Some(name) = name else {

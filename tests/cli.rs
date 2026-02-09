@@ -222,6 +222,178 @@ fn new_and_rm_roundtrip() {
 }
 
 #[test]
+fn new_db_auto_skips_non_interactive_and_true_runs() {
+    let td = init_repo();
+
+    // Repo-local config with a db reset command.
+    fs::write(
+        td.path().join(".wrt.json"),
+        r#"{
+  "version": 1,
+  "port_block_size": 100,
+  "package_manager": { "name": "unknown", "install_command": ["npm","install"], "notes": null },
+  "services": [],
+	  "database": {
+	    "detected": true,
+	    "kind": "unknown",
+	    "migrate_command": null,
+	    "seed_command": null,
+	    "reset_command": ["sh","-c","echo ran > .db_ran"],
+	    "notes": null
+	  },
+  "supabase": { "detected": false, "config_path": null, "start_command": null, "base_ports": null, "notes": null },
+  "notes": null
+}
+"#,
+    )
+    .unwrap();
+
+    // auto: stdin isn't a tty in tests, so it must not run the command.
+    let mut cmd = wrt_cmd();
+    cmd.current_dir(td.path()).args([
+        "new",
+        "x",
+        "--install",
+        "false",
+        "--supabase",
+        "false",
+        "--db",
+        "auto",
+    ]);
+    set_minimal_path(&mut cmd);
+    cmd.assert()
+        .success()
+        .stderr(predicate::str::contains("skipping in non-interactive mode"));
+
+    let wt_dir = td.path().join(".worktrees").join("x");
+    assert!(!wt_dir.join(".db_ran").exists());
+
+    // true: should run without prompting (still non-interactive).
+    let mut cmd = wrt_cmd();
+    cmd.current_dir(td.path()).args([
+        "new",
+        "y",
+        "--install",
+        "false",
+        "--supabase",
+        "false",
+        "--db",
+        "true",
+    ]);
+    set_minimal_path(&mut cmd);
+    cmd.assert().success();
+
+    let wt_dir = td.path().join(".worktrees").join("y");
+    assert!(wt_dir.join(".db_ran").exists());
+}
+
+#[test]
+fn new_db_true_does_not_fallback_to_seed_or_migrate() {
+    let td = init_repo();
+
+    // Only seed is present; `wrt new --db true` should not run it.
+    fs::write(
+        td.path().join(".wrt.json"),
+        r#"{
+  "version": 1,
+  "port_block_size": 100,
+  "package_manager": { "name": "unknown", "install_command": ["npm","install"], "notes": null },
+  "services": [],
+	  "database": {
+	    "detected": true,
+	    "kind": "unknown",
+	    "migrate_command": null,
+	    "seed_command": ["sh","-c","echo ran > .db_seed_ran"],
+	    "reset_command": null,
+	    "notes": null
+	  },
+  "supabase": { "detected": false, "config_path": null, "start_command": null, "base_ports": null, "notes": null },
+  "notes": null
+}
+"#,
+    )
+    .unwrap();
+
+    let mut cmd = wrt_cmd();
+    cmd.current_dir(td.path()).args([
+        "new",
+        "x",
+        "--install",
+        "false",
+        "--supabase",
+        "false",
+        "--db",
+        "true",
+    ]);
+    set_minimal_path(&mut cmd);
+    cmd.assert().success();
+
+    let wt_dir = td.path().join(".worktrees").join("x");
+    assert!(!wt_dir.join(".db_seed_ran").exists());
+}
+
+#[test]
+fn db_reset_requires_yes_non_interactive_and_runs_with_yes() {
+    let td = init_repo();
+
+    fs::write(
+        td.path().join(".wrt.json"),
+        r#"{
+  "version": 1,
+  "port_block_size": 100,
+  "package_manager": { "name": "unknown", "install_command": ["npm","install"], "notes": null },
+  "services": [],
+	  "database": {
+	    "detected": true,
+	    "kind": "unknown",
+	    "migrate_command": null,
+	    "seed_command": null,
+	    "reset_command": ["sh","-c","echo ran > .db_ran"],
+	    "notes": null
+	  },
+  "supabase": { "detected": false, "config_path": null, "start_command": null, "base_ports": null, "notes": null },
+  "notes": null
+}
+"#,
+    )
+    .unwrap();
+
+    wrt_cmd()
+        .current_dir(td.path())
+        .args([
+            "new",
+            "x",
+            "--install",
+            "false",
+            "--supabase",
+            "false",
+            "--db",
+            "false",
+        ])
+        .assert()
+        .success();
+
+    let wt_dir = td.path().join(".worktrees").join("x");
+
+    // Non-interactive test: must refuse without --yes.
+    let mut cmd = wrt_cmd();
+    cmd.current_dir(td.path()).args(["db", "x", "reset"]);
+    set_minimal_path(&mut cmd);
+    cmd.assert().code(2).stderr(predicate::str::contains(
+        "refusing to run reset non-interactively",
+    ));
+    assert!(!wt_dir.join(".db_ran").exists());
+
+    // With --yes, should run.
+    let mut cmd = wrt_cmd();
+    // Run from inside the worktree without passing <name>; should infer it.
+    cmd.current_dir(&wt_dir).args(["db", "reset", "--yes"]);
+    set_minimal_path(&mut cmd);
+    cmd.assert().success();
+    assert!(wt_dir.join(".db_ran").exists());
+}
+
+#[test]
 fn rm_delete_branch_removes_branch_ref() {
     let td = init_repo();
 
