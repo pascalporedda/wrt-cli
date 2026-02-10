@@ -204,6 +204,8 @@ fn new_and_rm_roundtrip() {
             "false",
             "--supabase",
             "false",
+            "--db",
+            "false",
         ])
         .assert()
         .success();
@@ -219,6 +221,31 @@ fn new_and_rm_roundtrip() {
         .success();
 
     assert!(!wt_dir.exists());
+}
+
+#[test]
+fn new_cd_prints_shell_cd_snippet() {
+    let td = init_repo();
+
+    let mut cmd = wrt_cmd();
+    cmd.current_dir(td.path()).args([
+        "new",
+        "x",
+        "--install",
+        "false",
+        "--supabase",
+        "false",
+        "--db",
+        "false",
+        "--cd",
+    ]);
+    set_minimal_path(&mut cmd);
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("cd '").and(predicate::str::contains("/.worktrees/x'")));
+
+    let wt_dir = td.path().join(".worktrees").join("x");
+    assert!(wt_dir.exists());
 }
 
 #[test]

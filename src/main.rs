@@ -20,7 +20,7 @@ const USAGE_TEXT: &str = r#"wrt: git worktree helper geared for parallel (agenti
 
 Usage:
   wrt init [--force] [--print] [--model <codex-model>]
-  wrt new <name> [--from <ref>] [--branch <branch>] [--install auto|true|false] [--supabase auto|true|false] [--db auto|true|false]
+  wrt new <name> [--from <ref>] [--branch <branch>] [--install auto|true|false] [--supabase auto|true|false] [--db auto|true|false] [--cd]
   wrt db [<name>] reset|seed|migrate [--print]
   wrt ls
   wrt path <name>
@@ -73,6 +73,9 @@ enum Cmd {
         supabase: String,
         #[arg(long, default_value = "auto")]
         db: String,
+        /// Print a `cd <path>` snippet to stdout after creation (use with `eval "$(wrt new ... --cd)"`)
+        #[arg(long)]
+        cd: bool,
     },
 
     /// Run database utilities for a worktree (reset/seed/migrate)
@@ -215,6 +218,7 @@ fn run() -> Result<i32> {
             install,
             supabase,
             db,
+            cd,
         } => {
             let opts = NewOpts {
                 name: &name,
@@ -223,6 +227,7 @@ fn run() -> Result<i32> {
                 install_mode: &install,
                 sb_mode: &supabase,
                 db_mode: &db,
+                emit_cd: cd,
             };
             cmd_new(&log, &repo, &mut st, opts)
         }
@@ -333,6 +338,7 @@ struct NewOpts<'a> {
     install_mode: &'a str,
     sb_mode: &'a str,
     db_mode: &'a str,
+    emit_cd: bool,
 }
 
 fn cmd_new(
@@ -447,6 +453,10 @@ fn cmd_new(
             log.errorf(&format!("db setup failed: {e}"));
             return Ok(1);
         }
+    }
+
+    if opts.emit_cd {
+        println!("cd {}", sh_quote(&wt_path.to_string_lossy()));
     }
 
     Ok(0)

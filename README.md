@@ -65,6 +65,18 @@ eval "$(wrt env)"
 echo "$WRT_PORT_OFFSET"
 ```
 
+Zsh convenience wrapper (auto-`cd` on `wrt new`):
+
+```zsh
+wrt() {
+  if [[ "$1" == "new" ]]; then
+    eval "$(command wrt "$@" --cd)"
+  else
+    command wrt "$@"
+  fi
+}
+```
+
 Run a command inside the worktree (without `cd`):
 
 ```bash
@@ -77,7 +89,7 @@ wrt run a-gpt-login-timeout -- sh -lc 'echo $WRT_NAME && env | rg ^WRT_'
 
 ```text
 wrt init [--force] [--print] [--model <codex-model>]
-wrt new <name> [--from <ref>] [--branch <branch>] [--install auto|true|false] [--supabase auto|true|false]
+wrt new <name> [--from <ref>] [--branch <branch>] [--install auto|true|false] [--supabase auto|true|false] [--db auto|true|false] [--cd]
 wrt ls
 wrt path <name>
 wrt env [<name>]
@@ -91,6 +103,9 @@ Examples:
 ```bash
 # create from a ref (default is HEAD)
 wrt new perf/agent-01 --from origin/main
+
+# create and jump into it (shell integration)
+eval "$(wrt new a/gpt/login-timeout --cd --install false --supabase false)"
 
 # keep the directory slugged but force a branch name
 wrt new "Agent 02: API cleanup" --branch agent/api-cleanup
