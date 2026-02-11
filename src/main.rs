@@ -406,6 +406,12 @@ fn cmd_new(
         return Ok(1);
     }
 
+    match worktree::copy_repo_env(&repo.root, &wt_path) {
+        Ok(true) => log.infof("copied .env from repo root"),
+        Ok(false) => {}
+        Err(e) => log.infof(&format!("copy .env failed: {e}")),
+    }
+
     let sb = opts.sb_mode.trim().to_lowercase();
     let install = opts.install_mode.trim().to_lowercase();
     let db_mode = opts.db_mode.trim().to_lowercase();
@@ -781,7 +787,22 @@ fn cmd_rm(
     };
 
     log.infof(&format!("removing worktree: {} ({})", a.name, a.path));
-    if let Err(e) = worktree::remove(&repo.root, Path::new(&a.path), force) {
+
+    let wt_path = Path::new(&a.path);
+    if wt_path.exists() && supabase::has_config(wt_path) {
+        if which("supabase").is_some() {
+            log.infof("stopping supabase containers");
+            if let Err(e) = run_cmd(wt_path, "supabase", &["stop"]) {
+                log.errorf(&format!("supabase stop failed: {e}"));
+                if !force {
+                    return Ok(1);
+                }
+                log.infof("continuing anyway (--force)");
+            }
+        }
+    }
+
+    if let Err(e) = worktree::remove(&repo.root, wt_path, force) {
         log.errorf(&format!("git worktree remove failed: {e}"));
         return Ok(1);
     }

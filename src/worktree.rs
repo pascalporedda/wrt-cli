@@ -109,6 +109,21 @@ pub fn write_env_file(wt_path: &Path, a: &crate::state::Allocation) -> Result<()
     Ok(())
 }
 
+pub fn copy_repo_env(repo_root: &Path, wt_path: &Path) -> Result<bool> {
+    let src = repo_root.join(".env");
+    if !src.is_file() {
+        return Ok(false);
+    }
+    let dst = wt_path.join(".env");
+    if dst.exists() {
+        return Ok(false);
+    }
+    fs::copy(&src, &dst).with_context(|| {
+        format!("copy {} -> {}", src.display(), dst.display())
+    })?;
+    Ok(true)
+}
+
 fn run_git<I, S>(dir: &Path, args: I) -> Result<()>
 where
     I: IntoIterator<Item = S>,

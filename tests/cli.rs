@@ -224,6 +224,23 @@ fn new_and_rm_roundtrip() {
 }
 
 #[test]
+fn new_copies_repo_env_when_present() {
+    let td = init_repo();
+
+    fs::write(td.path().join(".env"), "FOO=bar\n").unwrap();
+
+    wrt_cmd()
+        .current_dir(td.path())
+        .args(["new", "x", "--install", "false", "--supabase", "false", "--db", "false"])
+        .assert()
+        .success();
+
+    let wt_env = td.path().join(".worktrees").join("x").join(".env");
+    assert!(wt_env.exists());
+    assert_eq!(fs::read_to_string(wt_env).unwrap(), "FOO=bar\n");
+}
+
+#[test]
 fn new_cd_prints_shell_cd_snippet() {
     let td = init_repo();
 
