@@ -144,6 +144,17 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_suffix_edge_cases() {
+        assert_eq!(sanitize_suffix("--a--b--"), "a-b");
+        assert_eq!(sanitize_suffix(""), "");
+        assert_eq!(sanitize_suffix("café"), "caf");
+        assert_eq!(sanitize_suffix("   "), "");
+        assert_eq!(sanitize_suffix("a_b_c"), "a-b-c");
+        assert_eq!(sanitize_suffix("ABC123"), "abc123");
+        assert_eq!(sanitize_suffix("---"), "");
+    }
+
+    #[test]
     fn patch_config_updates_ports_and_project_and_urls() {
         let td = TempDir::new().unwrap();
         let sbdir = td.path().join("supabase");
@@ -160,5 +171,123 @@ mod tests {
         assert!(out.contains("project_id = \"myproj-a-gpt-fix\""));
         assert!(out.contains("port = 5632"));
         assert!(out.contains("http://localhost:3200"));
+    }
+
+    #[test]
+    fn patch_config_rejects_port_overflow() {
+        let td = TempDir::new().unwrap();
+        let sbdir = td.path().join("supabase");
+        fs::create_dir_all(&sbdir).unwrap();
+        let p = sbdir.join("config.toml");
+        fs::write(&p, "port = 65500\n").unwrap();
+
+        let result = patch_config(td.path(), "test", 100);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("port out of range"),
+            "expected port out of range error, got: {err}"
+        );
+        assert!(err.contains("65500") && err.contains("65600"));
+    }
+
+    #[test]
+    fn patch_config_port_at_boundary() {
+        let td = TempDir::new().unwrap();
+        let sbdir = td.path().join("supabase");
+        fs::create_dir_all(&sbdir).unwrap();
+        let p = sbdir.join("config.toml");
+        fs::write(&p, "port = 65435\n").unwrap();
+
+        patch_config(td.path(), "test", 100).unwrap();
+        let out = fs::read_to_string(&p).unwrap();
+        assert!(out.contains("port = 65535"), "expected port = 65535, got: {out}");
+    }
+
+    #[test]
+    fn patch_config_project_id_is_idempotent() {
+        let td = TempDir::new().unwrap();
+        let sbdir = td.path().join("supabase");
+        fs::create_dir_all(&sbdir).unwrap();
+        let p = sbdir.join("config.toml");
+        fs::write(&p, "project_id = \"myproj\"\n").unwrap();
+
+        patch_config(td.path(), "wt1", 0).unwrap();
+        let after_first = fs::read_to_string(&p).unwrap();
+
+        patch_config(td.path(), "wt1", 0).unwrap();
+        let after_second = fs::read_to_string(&p).unwrap();
+
+        assert_eq!(after_first, after_second, "second run should not change project_id");
+        assert!(after_first.contains("project_id = \"myproj-wt1\""));
+    }
+
+    #[test]
+    fn patch_config_no_change_when_already_suffixed() {
+        let td = TempDir::new().unwrap();
+        let sbdir = td.path().join("supabase");
+        fs::create_dir_all(&sbdir).unwrap();
+        let p = sbdir.join("config.toml");
+        fs::write(&p, "project_id = \"myproj-wt1\"\n").unwrap();
+
+        patch_config(td.path(), "wt1", 0).unwrap();
+        let out = fs::read_to_string(&p).unwrap();
+        assert!(
+            out.contains("project_id = \"myproj-wt1\""),
+            "should not double-suffix: {out}"
+        );
+        assert!(!out.contains("myproj-wt1-wt1"));
+    }
+
+    #[test]
+    fn patch_config_handles_all_port_types() {
+        let td = TempDir::new().unwrap();
+        let sbdir = td.path().join("supabase");
+        fs::create_dir_all(&sbdir).unwrap();
+        let p = sbdir.join("config.toml");
+        fs::write(
+            &p,
+            r#"port = 5432
+shadow_port = 5433
+smtp_port = 2500
+pop3_port = 1100
+"#,
+        )
+        .unwrap();
+
+        patch_config(td.path(), "test", 100).unwrap();
+        let out = fs::read_to_string(&p).unwrap();
+        assert!(out.contains("port = 5532"), "port not offset: {out}");
+        assert!(out.contains("shadow_port = 5533"), "shadow_port not offset: {out}");
+        assert!(out.contains("smtp_port = 2600"), "smtp_port not offset: {out}");
+        assert!(out.contains("pop3_port = 1200"), "pop3_port not offset: {out}");
+    }
+
+    #[test]
+    fn patch_config_preserves_comments() {
+        let td = TempDir::new().unwrap();
+        let sbdir = td.path().join("supabase");
+        fs::create_dir_all(&sbdir).unwrap();
+        let p = sbdir.join("config.toml");
+        fs::write(&p, "port = 5432 # database port\n").unwrap();
+
+        patch_config(td.path(), "test", 100).unwrap();
+        let out = fs::read_to_string(&p).unwrap();
+        assert!(
+            out.contains("port = 5532 # database port"),
+            "comment not preserved: {out}"
+        );
+    }
+
+    #[test]
+    fn patch_config_errors_on_missing_file() {
+        let td = TempDir::new().unwrap();
+        let result = patch_config(td.path(), "test", 100);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("read") || err.contains("config.toml") || err.contains("No such file"),
+            "expected file not found error, got: {err}"
+        );
     }
 }
