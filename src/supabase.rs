@@ -201,7 +201,10 @@ mod tests {
 
         patch_config(td.path(), "test", 100).unwrap();
         let out = fs::read_to_string(&p).unwrap();
-        assert!(out.contains("port = 65535"), "expected port = 65535, got: {out}");
+        assert!(
+            out.contains("port = 65535"),
+            "expected port = 65535, got: {out}"
+        );
     }
 
     #[test]
@@ -218,7 +221,10 @@ mod tests {
         patch_config(td.path(), "wt1", 0).unwrap();
         let after_second = fs::read_to_string(&p).unwrap();
 
-        assert_eq!(after_first, after_second, "second run should not change project_id");
+        assert_eq!(
+            after_first, after_second,
+            "second run should not change project_id"
+        );
         assert!(after_first.contains("project_id = \"myproj-wt1\""));
     }
 
@@ -258,9 +264,18 @@ pop3_port = 1100
         patch_config(td.path(), "test", 100).unwrap();
         let out = fs::read_to_string(&p).unwrap();
         assert!(out.contains("port = 5532"), "port not offset: {out}");
-        assert!(out.contains("shadow_port = 5533"), "shadow_port not offset: {out}");
-        assert!(out.contains("smtp_port = 2600"), "smtp_port not offset: {out}");
-        assert!(out.contains("pop3_port = 1200"), "pop3_port not offset: {out}");
+        assert!(
+            out.contains("shadow_port = 5533"),
+            "shadow_port not offset: {out}"
+        );
+        assert!(
+            out.contains("smtp_port = 2600"),
+            "smtp_port not offset: {out}"
+        );
+        assert!(
+            out.contains("pop3_port = 1200"),
+            "pop3_port not offset: {out}"
+        );
     }
 
     #[test]

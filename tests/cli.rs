@@ -224,6 +224,65 @@ fn new_and_rm_roundtrip() {
 }
 
 #[test]
+fn new_uses_upstream_branch_when_present() {
+    let td = init_repo();
+    let origin = TempDir::new().unwrap();
+
+    git(origin.path(), &["init", "--bare"]);
+    git(
+        td.path(),
+        &["remote", "add", "origin", origin.path().to_str().unwrap()],
+    );
+
+    let main = git_out(td.path(), &["rev-parse", "--abbrev-ref", "HEAD"]);
+    let main = main.trim();
+    git(td.path(), &["push", "-u", "origin", main]);
+
+    git(td.path(), &["checkout", "-b", "feature/upstream"]);
+    fs::write(td.path().join("FEATURE.txt"), "hello\n").unwrap();
+    git(td.path(), &["add", "FEATURE.txt"]);
+    git(
+        td.path(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-m",
+            "feature",
+        ],
+    );
+    git(td.path(), &["push", "-u", "origin", "feature/upstream"]);
+
+    git(td.path(), &["checkout", main]);
+    git(td.path(), &["branch", "-D", "feature/upstream"]);
+
+    let mut cmd = wrt_cmd();
+    cmd.current_dir(td.path()).args([
+        "new",
+        "feature/upstream",
+        "--install",
+        "false",
+        "--supabase",
+        "false",
+        "--db",
+        "false",
+    ]);
+    set_minimal_path(&mut cmd);
+    cmd.assert().success();
+
+    let wt_dir = td.path().join(".worktrees").join("feature-upstream");
+    assert!(wt_dir.join("FEATURE.txt").exists());
+
+    let upstream = git_out(
+        td.path(),
+        &["rev-parse", "--abbrev-ref", "feature/upstream@{upstream}"],
+    );
+    assert_eq!(upstream.trim(), "origin/feature/upstream");
+}
+
+#[test]
 fn new_copies_repo_env_when_present() {
     let td = init_repo();
 
@@ -231,7 +290,16 @@ fn new_copies_repo_env_when_present() {
 
     wrt_cmd()
         .current_dir(td.path())
-        .args(["new", "x", "--install", "false", "--supabase", "false", "--db", "false"])
+        .args([
+            "new",
+            "x",
+            "--install",
+            "false",
+            "--supabase",
+            "false",
+            "--db",
+            "false",
+        ])
         .assert()
         .success();
 

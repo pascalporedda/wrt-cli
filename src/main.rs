@@ -6,6 +6,7 @@ use std::process::ExitCode;
 mod cli;
 mod cmd;
 mod codex;
+mod completions;
 mod db;
 mod gitx;
 mod pm;
@@ -41,10 +42,21 @@ fn run() -> Result<i32> {
         return Ok(2);
     };
 
-    if matches!(&cmd, Cmd::Help) {
-        print!("{USAGE_TEXT}");
-        return Ok(0);
-    }
+    let cmd = match cmd {
+        Cmd::Help => {
+            print!("{USAGE_TEXT}");
+            return Ok(0);
+        }
+        Cmd::Completions { shell } => {
+            if shell.trim().eq_ignore_ascii_case("zsh") {
+                print!("{}", completions::zsh_script());
+                return Ok(0);
+            }
+            log.errorf("unsupported shell (only zsh is available)");
+            return Ok(2);
+        }
+        other => other,
+    };
 
     let cwd = env::current_dir()?;
     let repo = match gitx::detect_repo(&cwd) {
@@ -137,5 +149,6 @@ fn run() -> Result<i32> {
             }
             cmd_run(&log, &st, &name, &command)
         }
+        Cmd::Completions { .. } => Ok(0),
     }
 }

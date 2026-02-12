@@ -65,6 +65,26 @@ eval "$(wrt env)"
 echo "$WRT_PORT_OFFSET"
 ```
 
+## Shell Integration
+
+1. Zsh completions (manual `fpath`)
+```zsh
+mkdir -p ~/.zsh/completions
+wrt completions zsh > ~/.zsh/completions/_wrt
+echo 'fpath=(~/.zsh/completions $fpath)\nautoload -Uz compinit && compinit' >> ~/.zshrc
+```
+Restart your shell or `exec zsh`.
+
+2. Oh My Zsh plugin
+```zsh
+mkdir -p ~/.oh-my-zsh/custom/plugins/wrt
+wrt completions zsh > ~/.oh-my-zsh/custom/plugins/wrt/_wrt
+cat > ~/.oh-my-zsh/custom/plugins/wrt/wrt.plugin.zsh <<'EOF'
+fpath=(${0:A:h} $fpath)
+EOF
+```
+Add `wrt` to `plugins=(...)` in `~/.zshrc`, then restart your shell.
+
 Zsh convenience wrapper (auto-`cd` on `wrt new`):
 
 ```zsh
@@ -96,6 +116,7 @@ wrt env [<name>]
 wrt rm <name> [--force] [--delete-branch]
 wrt prune
 wrt run <name> -- <command> [args...]
+wrt completions zsh
 ```
 
 Examples:

@@ -41,8 +41,16 @@ pub fn ensure_dir(dir: &Path) -> Result<()> {
 }
 
 pub fn add(repo_root: &Path, wt_path: &Path, branch: &str, from_ref: &str) -> Result<()> {
-    // Prefer creating a new branch. If branch exists, fall back to checking it out.
-    if run_git(
+    let remotes = list_remotes(repo_root)?;
+    let remote = pick_remote(&remotes);
+
+    if let Some(remote) = remote {
+        run_git(repo_root, ["fetch", "--prune", remote])
+            .with_context(|| format!("git fetch --prune {remote}"))?;
+    }
+
+    // Prefer existing local branch. If it doesn't exist, check for upstream.
+    if git_ok(
         repo_root,
         [
             "show-ref",
@@ -50,9 +58,7 @@ pub fn add(repo_root: &Path, wt_path: &Path, branch: &str, from_ref: &str) -> Re
             "--quiet",
             &format!("refs/heads/{branch}"),
         ],
-    )
-    .is_ok()
-    {
+    )? {
         return run_git(
             repo_root,
             [
@@ -63,6 +69,30 @@ pub fn add(repo_root: &Path, wt_path: &Path, branch: &str, from_ref: &str) -> Re
             ],
         );
     }
+
+    if let Some(remote) = remote {
+        let remote_ref = format!("refs/remotes/{remote}/{branch}");
+        if git_ok(
+            repo_root,
+            ["show-ref", "--verify", "--quiet", remote_ref.as_str()],
+        )? {
+            let start_point = format!("{remote}/{branch}");
+            run_git(
+                repo_root,
+                ["branch", "--track", branch, start_point.as_str()],
+            )?;
+            return run_git(
+                repo_root,
+                [
+                    "worktree",
+                    "add",
+                    wt_path.to_string_lossy().as_ref(),
+                    branch,
+                ],
+            );
+        }
+    }
+
     run_git(
         repo_root,
         [
@@ -118,9 +148,7 @@ pub fn copy_repo_env(repo_root: &Path, wt_path: &Path) -> Result<bool> {
     if dst.exists() {
         return Ok(false);
     }
-    fs::copy(&src, &dst).with_context(|| {
-        format!("copy {} -> {}", src.display(), dst.display())
-    })?;
+    fs::copy(&src, &dst).with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
     Ok(true)
 }
 
@@ -141,6 +169,58 @@ where
         return Err(anyhow!("git command failed"));
     }
     Ok(())
+}
+
+fn git_ok<I, S>(dir: &Path, args: I) -> Result<bool>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("run git")?;
+    Ok(status.success())
+}
+
+fn git_out<I, S>(dir: &Path, args: I) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .context("run git")?;
+    if !out.status.success() {
+        return Err(anyhow!("git command failed"));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn list_remotes(repo_root: &Path) -> Result<Vec<String>> {
+    let out = git_out(repo_root, ["remote"])?;
+    Ok(out
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect())
+}
+
+fn pick_remote(remotes: &[String]) -> Option<&str> {
+    if remotes.is_empty() {
+        return None;
+    }
+    for r in remotes {
+        if r == "origin" {
+            return Some(r.as_str());
+        }
+    }
+    remotes.first().map(|r| r.as_str())
 }
 
 fn run_git_vec(dir: &Path, args: &[String]) -> Result<()> {

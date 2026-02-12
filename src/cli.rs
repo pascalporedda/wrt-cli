@@ -12,6 +12,7 @@ Usage:
   wrt rm <name> [--force] [--delete-branch]
   wrt prune
   wrt run <name> -- <command> [args...]
+  wrt completions zsh
 
 Conventions:
   - Worktrees live under: <repo>/.worktrees/<name>
@@ -113,6 +114,9 @@ pub enum Cmd {
         #[arg(required = true, value_name = "COMMAND", num_args = 1.., allow_hyphen_values = true)]
         command: Vec<String>,
     },
+
+    /// Generate shell completions (currently zsh only)
+    Completions { shell: String },
 }
 
 #[derive(Subcommand, Debug, Clone)]
