@@ -1,39 +1,16 @@
-# Repository Guidelines
+# Repository Notes
 
-## Project Structure & Module Organization
+- Rust CLI code lives in `src/`, split by concern: `gitx`, `worktree`, `state`, `supabase`, `codex`, `pm`, `ui`.
+- `assets/` contains the prompt and JSON schema embedded by `wrt init`.
+- `tests/` contains integration tests that create temp git repos.
+- Do not commit runtime artifacts: `.worktrees/<name>/`, `.wrt.env`, `.wrt.json`.
 
-- `src/`: Rust CLI entrypoint and internal modules (git/worktree/state/supabase/codex/pm/ui).
-- `assets/`: embedded prompt + JSON schema used by `wrt init`.
-- `tests/`: integration tests (temp git repos).
-- Runtime artifacts (do not commit): `.worktrees/<name>/`, `.wrt.env`, `.wrt.json`.
+## Local Behavior
 
-## Build, Test, and Development Commands
+- `wrt new <name>` accepts slash-separated names like `a/gpt/fix-login-timeout`; the directory name is slugged under `.worktrees/`.
+- `wrt init` shells out to the Codex CLI. For offline tests, set `WRT_CODEX_MOCK_OUTPUT=/path/to/out.json`.
+- `wrt` may patch `supabase/config.toml` to avoid port/container collisions; review those local-only changes before committing.
 
-- `cargo install --path .`: build and install `wrt` into Cargo's bin dir.
-- `cargo run -- help`: run from source without installing.
-- `cargo test`: run the full test suite.
-- `cargo fmt`: format.
-- `cargo clippy --all-targets -- -D warnings`: lint.
+## Checks
 
-## Coding Style & Naming Conventions
-
-- Rust: follow standard Rust conventions; run `cargo fmt`.
-- Prefer small modules with clear boundaries (`gitx`, `worktree`, `state`, `supabase`, `codex`, `pm`, `ui`).
-- CLI flags use kebab-style as exposed to users (e.g. `--from`, `--delete-branch`).
-- Worktree names and branches: `wrt new <name>` accepts slash-separated names (e.g. `a/gpt/fix-login-timeout`); the directory is slugged under `.worktrees/`.
-
-## Testing Guidelines
-
-- Prefer unit tests in-module for parsing/normalization.
-- Use integration tests for filesystem mutations and git interactions (worktree creation/removal, `.wrt.env`, state persistence).
-- Use temp dirs and init a temp git repo; avoid relying on global git state.
-
-## Commit & Pull Request Guidelines
-
-- Git history may be unavailable in this checkout (no `.git/`); use a consistent convention like `feat: ...`, `fix: ...`, `refactor: ...`, `test: ...`, `docs: ...`.
-- PRs: describe what changed and why (including user-facing CLI behavior), include repro commands, and include `cargo test` output.
-
-## Security & Configuration Tips
-
-- `wrt init` shells out to the Codex CLI; for offline testing set `WRT_CODEX_MOCK_OUTPUT=/path/to/out.json`.
-- `wrt` may patch `supabase/config.toml` to avoid port/container collisions; double-check local-only changes before committing.
+- Usual loop: `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test`.
