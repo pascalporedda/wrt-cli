@@ -123,18 +123,13 @@ fn run() -> Result<i32> {
             action,
         ),
 
-        Cmd::Ls | Cmd::List => cmd_ls(&st),
+        Cmd::Ls => cmd_ls(&st),
 
         Cmd::Path { name } => cmd_path(&log, &st, &name),
 
         Cmd::Env { name } => cmd_env(&log, &st, name.as_deref()),
 
         Cmd::Rm {
-            name,
-            force,
-            delete_branch,
-        }
-        | Cmd::Remove {
             name,
             force,
             delete_branch,

@@ -20,7 +20,7 @@ pub fn run_cmd(dir: &Path, cmd: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-pub fn run_argv_with_wrt_env(dir: &Path, a: &Allocation, argv: &[String]) -> Result<()> {
+pub fn run_argv_with_wrt_env(dir: &Path, a: &Allocation, argv: &[String]) -> Result<i32> {
     let cmd = &argv[0];
     let cmd_args = &argv[1..];
 
@@ -44,9 +44,9 @@ pub fn run_argv_with_wrt_env(dir: &Path, a: &Allocation, argv: &[String]) -> Res
 
     let status = c.status().with_context(|| format!("run {cmd}"))?;
     if !status.success() {
-        return Err(anyhow::anyhow!("command failed"));
+        return Ok(status.code().unwrap_or(1));
     }
-    Ok(())
+    Ok(0)
 }
 
 pub fn which(bin: &str) -> Option<PathBuf> {

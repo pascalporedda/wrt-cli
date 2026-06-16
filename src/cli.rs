@@ -77,8 +77,6 @@ pub enum Cmd {
 
     /// List tracked worktrees
     Ls,
-    /// Alias for ls
-    List,
 
     /// Print worktree path
     Path { name: String },
@@ -88,14 +86,6 @@ pub enum Cmd {
 
     /// Remove a worktree
     Rm {
-        name: String,
-        #[arg(long)]
-        force: bool,
-        #[arg(long = "delete-branch")]
-        delete_branch: bool,
-    },
-    /// Alias for rm
-    Remove {
         name: String,
         #[arg(long)]
         force: bool,

@@ -1,10 +1,8 @@
 use anyhow::Result;
-use std::fs;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use crate::cli::DbAction;
-use crate::codex;
 use crate::db;
 use crate::gitx;
 use crate::state::State;
@@ -41,38 +39,12 @@ pub fn cmd_db(
     };
 
     let wt_path = PathBuf::from(&a.path);
-    let cfg_path = repo.root.join(".wrt.json");
-
-    let mut kind_hint: Option<String> = None;
-    let mut cmd: Option<Vec<String>> = None;
     let (op, yes, print) = match action {
         DbAction::Reset { yes, print } => ("reset", yes, print),
         DbAction::Seed { print } => ("seed", false, print),
         DbAction::Migrate { print } => ("migrate", false, print),
     };
-
-    if cfg_path.exists() {
-        if let Ok(s) = fs::read_to_string(&cfg_path) {
-            if let Ok(d) = serde_json::from_str::<codex::Discovery>(&s) {
-                if d.database.detected {
-                    kind_hint = d.database.kind.clone();
-                }
-                cmd = match op {
-                    "reset" => d.database.reset_command.clone(),
-                    "seed" => d.database.seed_command.clone(),
-                    "migrate" => d.database.migrate_command.clone(),
-                    _ => None,
-                };
-            } else {
-                log.infof("could not parse .wrt.json; skipping DB setup from config");
-            }
-        }
-    }
-
-    if cmd.is_none() && op == "reset" && db::has_supabase_seed_or_migrations(&wt_path) {
-        kind_hint = kind_hint.or(Some("supabase".into()));
-        cmd = Some(vec!["supabase".into(), "db".into(), "reset".into()]);
-    }
+    let (kind_hint, cmd) = db::command(&repo.root, &wt_path, op);
 
     let Some(argv) = cmd else {
         let label = kind_hint.as_deref().unwrap_or("database");
@@ -110,9 +82,5 @@ pub fn cmd_db(
     }
 
     log.infof(&format!("{label}: running: {cmd_str}"));
-    if let Err(e) = run_argv_with_wrt_env(&wt_path, a, &argv) {
-        log.errorf(&format!("{label}: command failed: {e}"));
-        return Ok(1);
-    }
-    Ok(0)
+    run_argv_with_wrt_env(&wt_path, a, &argv)
 }

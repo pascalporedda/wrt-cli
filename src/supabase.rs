@@ -1,27 +1,6 @@
 use anyhow::{anyhow, Context, Result};
-use regex::Regex;
 use std::fs;
 use std::path::Path;
-
-fn re_port_assign() -> &'static Regex {
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"^(\s*(?:port|shadow_port|smtp_port|pop3_port)\s*=\s*)(\d+)(\s*(?:#.*)?)$")
-            .expect("regex")
-    })
-}
-
-fn re_project_id() -> &'static Regex {
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r#"^(\s*project_id\s*=\s*)"(.*)"(\s*(?:#.*)?)$"#).expect("regex"))
-}
-
-fn re_local_url_port() -> &'static Regex {
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"((?:https?://)(?:127\.0\.0\.1|localhost)):(\d+)").expect("regex")
-    })
-}
 
 pub fn has_config(repo_root: &Path) -> bool {
     repo_root.join("supabase").join("config.toml").exists()
@@ -40,8 +19,7 @@ pub fn patch_config(worktree_root: &Path, worktree_name: &str, offset: i32) -> R
     let mut changed = false;
 
     for line in &mut lines {
-        if let Some(caps) = re_project_id().captures(line) {
-            let base = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+        if let Some((prefix, base, tail)) = project_id_parts(line) {
             let suffix = sanitize_suffix(worktree_name);
 
             // Avoid double-suffixing if re-run.
@@ -51,42 +29,22 @@ pub fn patch_config(worktree_root: &Path, worktree_name: &str, offset: i32) -> R
             }
 
             if want != base {
-                let prefix = caps.get(1).unwrap().as_str();
-                let tail = caps.get(3).unwrap().as_str();
                 *line = format!("{prefix}\"{want}\"{tail}");
                 changed = true;
             }
             continue;
         }
 
-        if let Some(caps) = re_port_assign().captures(line) {
-            let n: i32 = caps.get(2).unwrap().as_str().parse().unwrap_or(0);
-            if n > 0 {
-                let n2 = n + offset;
-                if !(1..=65535).contains(&n2) {
-                    return Err(anyhow!("port out of range after offset: {n} -> {n2}"));
-                }
-                if n2 != n {
-                    let prefix = caps.get(1).unwrap().as_str();
-                    let tail = caps.get(3).unwrap().as_str();
-                    *line = format!("{prefix}{n2}{tail}");
-                    changed = true;
-                }
+        if let Some(nline) = patch_port_line(line, offset)? {
+            if nline != *line {
+                *line = nline;
+                changed = true;
             }
             continue;
         }
 
         if line.contains("http://") || line.contains("https://") {
-            let nline = re_local_url_port().replace_all(line, |caps: &regex::Captures| {
-                let host = caps.get(1).unwrap().as_str();
-                let port: i32 = caps.get(2).unwrap().as_str().parse().unwrap_or(0);
-                let p2 = port + offset;
-                if !(1..=65535).contains(&p2) {
-                    return format!("{host}:{port}");
-                }
-                format!("{host}:{p2}")
-            });
-            let nline = nline.to_string();
+            let nline = patch_local_url_ports(line, offset);
             if nline != *line {
                 *line = nline;
                 changed = true;
@@ -105,6 +63,140 @@ pub fn patch_config(worktree_root: &Path, worktree_name: &str, offset: i32) -> R
 
     fs::write(&p, out.as_bytes()).with_context(|| format!("write {}", p.display()))?;
     Ok(())
+}
+
+fn project_id_parts(line: &str) -> Option<(&str, &str, &str)> {
+    let trimmed = line.trim_start();
+    if !trimmed.starts_with("project_id") {
+        return None;
+    }
+
+    let key_start = line.len() - trimmed.len();
+    let after_key = key_start + "project_id".len();
+    let rest = &line[after_key..];
+    let eq_pos = rest.find('=')?;
+    if !rest[..eq_pos].trim().is_empty() {
+        return None;
+    }
+
+    let value_start = after_key + eq_pos + 1;
+    let after_eq = &line[value_start..];
+    let quote_offset = after_eq.find('"')?;
+    if !after_eq[..quote_offset].trim().is_empty() {
+        return None;
+    }
+
+    let open = value_start + quote_offset;
+    let close = line[open + 1..].find('"')? + open + 1;
+    let tail = &line[close + 1..];
+    if !tail.trim_start().starts_with('#') && !tail.trim().is_empty() {
+        return None;
+    }
+
+    Some((&line[..open], &line[open + 1..close], tail))
+}
+
+fn patch_port_line(line: &str, offset: i32) -> Result<Option<String>> {
+    let trimmed = line.trim_start();
+    let Some(key) = ["port", "shadow_port", "smtp_port", "pop3_port"]
+        .iter()
+        .find(|key| trimmed.starts_with(**key))
+    else {
+        return Ok(None);
+    };
+
+    let key_start = line.len() - trimmed.len();
+    let after_key = key_start + key.len();
+    let rest = &line[after_key..];
+    let eq_pos = match rest.find('=') {
+        Some(pos) if rest[..pos].trim().is_empty() => pos,
+        _ => return Ok(None),
+    };
+
+    let value_start = after_key + eq_pos + 1;
+    let after_eq = &line[value_start..];
+    let digit_offset = after_eq.find(|ch: char| ch.is_ascii_digit());
+    let Some(digit_offset) = digit_offset else {
+        return Ok(None);
+    };
+    if !after_eq[..digit_offset].trim().is_empty() {
+        return Ok(None);
+    }
+
+    let digits_start = value_start + digit_offset;
+    let digits_len = line[digits_start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .map(char::len_utf8)
+        .sum::<usize>();
+    let digits_end = digits_start + digits_len;
+    let tail = &line[digits_end..];
+    if !tail.trim_start().starts_with('#') && !tail.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let n: i32 = line[digits_start..digits_end].parse().unwrap_or(0);
+    if n == 0 {
+        return Ok(Some(line.to_string()));
+    }
+
+    let n2 = n + offset;
+    if !(1..=65535).contains(&n2) {
+        return Err(anyhow!("port out of range after offset: {n} -> {n2}"));
+    }
+    Ok(Some(format!("{}{}{}", &line[..digits_start], n2, tail)))
+}
+
+fn patch_local_url_ports(line: &str, offset: i32) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+
+    while i < line.len() {
+        let rest = &line[i..];
+        let Some(prefix_len) = local_url_prefix(rest) else {
+            out.push_str(&line[i..]);
+            break;
+        };
+
+        out.push_str(&rest[..prefix_len]);
+        let port_start = i + prefix_len;
+        let port_len = line[port_start..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .map(char::len_utf8)
+            .sum::<usize>();
+        if port_len == 0 {
+            i = port_start;
+            continue;
+        }
+
+        let port_end = port_start + port_len;
+        let port: i32 = line[port_start..port_end].parse().unwrap_or(0);
+        let p2 = port + offset;
+        if (1..=65535).contains(&p2) {
+            out.push_str(&p2.to_string());
+        } else {
+            out.push_str(&line[port_start..port_end]);
+        }
+        i = port_end;
+    }
+
+    out
+}
+
+fn local_url_prefix(s: &str) -> Option<usize> {
+    const PREFIXES: [&str; 4] = [
+        "http://localhost:",
+        "https://localhost:",
+        "http://127.0.0.1:",
+        "https://127.0.0.1:",
+    ];
+
+    let (idx, prefix) = PREFIXES
+        .iter()
+        .filter_map(|prefix| s.find(prefix).map(|idx| (idx, *prefix)))
+        .min_by_key(|(idx, _)| *idx)?;
+    Some(idx + prefix.len())
 }
 
 fn sanitize_suffix(s: &str) -> String {

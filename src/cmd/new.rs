@@ -1,10 +1,8 @@
 use anyhow::Result;
 use chrono::SecondsFormat;
-use std::fs;
 use std::io::IsTerminal;
 use std::path::Path;
 
-use crate::codex;
 use crate::db;
 use crate::gitx;
 use crate::pm;
@@ -157,42 +155,10 @@ fn maybe_run_db_setup(
     wt_path: &Path,
     db_mode: &str,
 ) -> Result<()> {
-    let mut kind_hint: Option<String> = None;
-    let mut reset_cmd: Option<Vec<String>> = None;
-
-    let cfg_path = repo.root.join(".wrt.json");
-    if cfg_path.exists() {
-        if let Ok(s) = fs::read_to_string(&cfg_path) {
-            if let Ok(d) = serde_json::from_str::<codex::Discovery>(&s) {
-                if d.database.detected {
-                    kind_hint = d.database.kind.clone();
-                }
-                reset_cmd = d.database.reset_command.clone();
-            } else {
-                log.infof("could not parse .wrt.json; skipping DB setup from config");
-            }
-        }
-    }
-
-    if reset_cmd.is_none() && db::has_supabase_seed_or_migrations(wt_path) {
-        kind_hint = kind_hint.or(Some("supabase".into()));
-        reset_cmd = Some(vec!["supabase".into(), "db".into(), "reset".into()]);
-    }
+    let (kind_hint, reset_cmd) = db::command(&repo.root, wt_path, "reset");
 
     let Some(argv) = reset_cmd else {
-        let mut hints: Vec<&str> = Vec::new();
-        if db::has_prisma_schema(wt_path) {
-            hints.push("prisma");
-        }
-        if db::has_sqlx_markers(wt_path) {
-            hints.push("sqlx");
-        }
-        if !hints.is_empty() {
-            log.infof(&format!(
-                "db tooling detected ({}) but no reset command known; run `wrt init` to generate .wrt.json or use `wrt db <name> seed|migrate`",
-                hints.join(", ")
-            ));
-        }
+        log.infof("no reset command known; run `wrt init` to generate .wrt.json");
         return Ok(());
     };
 
@@ -206,7 +172,10 @@ fn maybe_run_db_setup(
     match db_mode {
         "true" => {
             log.infof(&format!("{label}: running db setup: {cmd_str}"));
-            run_argv_with_wrt_env(wt_path, alloc, &argv)?;
+            let code = run_argv_with_wrt_env(wt_path, alloc, &argv)?;
+            if code != 0 {
+                anyhow::bail!("command failed");
+            }
         }
         "auto" => {
             if !std::io::stdin().is_terminal() {
@@ -224,7 +193,10 @@ fn maybe_run_db_setup(
             }
 
             log.infof(&format!("{label}: running db setup: {cmd_str}"));
-            run_argv_with_wrt_env(wt_path, alloc, &argv)?;
+            let code = run_argv_with_wrt_env(wt_path, alloc, &argv)?;
+            if code != 0 {
+                anyhow::bail!("command failed");
+            }
         }
         "false" => {}
         _ => {

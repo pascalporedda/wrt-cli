@@ -1,38 +1,41 @@
+use crate::codex;
+use std::fs;
 use std::path::Path;
 
 pub fn has_supabase_seed_or_migrations(root: &Path) -> bool {
     let sb = root.join("supabase");
-    if !sb.is_dir() {
-        return false;
-    }
-    if sb.join("seed.sql").exists() {
-        return true;
-    }
-    if sb.join("migrations").is_dir() {
-        return true;
-    }
-    false
+    sb.join("seed.sql").exists() || sb.join("migrations").is_dir()
 }
 
-pub fn has_prisma_schema(root: &Path) -> bool {
-    root.join("prisma").join("schema.prisma").exists() || root.join("schema.prisma").exists()
-}
+pub fn command(
+    repo_root: &Path,
+    wt_path: &Path,
+    op: &str,
+) -> (Option<String>, Option<Vec<String>>) {
+    let mut kind = None;
+    let mut cmd = None;
 
-pub fn has_sqlx_markers(root: &Path) -> bool {
-    if root.join("sqlx-data.json").exists() {
-        return true;
-    }
-    if root.join("migrations").is_dir() {
-        // Heuristic: lots of tools use migrations/, but if we don't have better info, keep it weak.
-        // We only use this for "kind" hints and logging.
-        return true;
-    }
-    let cargo = root.join("Cargo.toml");
-    if let Ok(s) = std::fs::read_to_string(cargo) {
-        // Cheap substring scan; avoid TOML parsing deps.
-        if s.contains("sqlx") {
-            return true;
+    let cfg_path = repo_root.join(".wrt.json");
+    if cfg_path.exists() {
+        if let Ok(s) = fs::read_to_string(&cfg_path) {
+            if let Ok(d) = serde_json::from_str::<codex::Discovery>(&s) {
+                if d.database.detected {
+                    kind = d.database.kind.clone();
+                }
+                cmd = match op {
+                    "reset" => d.database.reset_command.clone(),
+                    "seed" => d.database.seed_command.clone(),
+                    "migrate" => d.database.migrate_command.clone(),
+                    _ => None,
+                };
+            }
         }
     }
-    false
+
+    if cmd.is_none() && op == "reset" && has_supabase_seed_or_migrations(wt_path) {
+        kind = kind.or(Some("supabase".into()));
+        cmd = Some(vec!["supabase".into(), "db".into(), "reset".into()]);
+    }
+
+    (kind, cmd)
 }

@@ -1,28 +1,27 @@
 use anyhow::{anyhow, Context, Result};
-use regex::Regex;
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-fn re_space() -> &'static Regex {
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\s+").expect("regex"))
-}
-
-fn re_slug() -> &'static Regex {
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"[^a-z0-9]+").expect("regex"))
-}
-
 pub fn slug(s: &str) -> String {
-    let mut s = s.trim().to_lowercase();
-    s = re_space().replace_all(&s, "-").to_string();
-    s = re_slug().replace_all(&s, "-").to_string();
-    s = s.trim_matches('-').to_string();
-    if s.is_empty() {
+    let mut out = String::new();
+    let mut prev_dash = false;
+
+    for ch in s.trim().chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
+            out.push(ch);
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
         return "wrt".to_string();
     }
-    s
+    out
 }
 
 pub fn normalize_branch(s: &str) -> String {
@@ -31,8 +30,7 @@ pub fn normalize_branch(s: &str) -> String {
         s = rest.to_string();
     }
     // Avoid spaces; git is okay with more but keeping it strict helps automation.
-    s = re_space().replace_all(&s, "-").to_string();
-    s
+    s.split_whitespace().collect::<Vec<_>>().join("-")
 }
 
 pub fn ensure_dir(dir: &Path) -> Result<()> {
@@ -112,7 +110,7 @@ pub fn remove(repo_root: &Path, wt_path: &Path, force: bool) -> Result<()> {
         args.push("--force".into());
     }
     args.push(wt_path.to_string_lossy().to_string());
-    run_git_vec(repo_root, &args)
+    run_git(repo_root, args)
 }
 
 pub fn is_dirty(wt_path: &Path) -> Result<bool> {
@@ -221,20 +219,6 @@ fn pick_remote(remotes: &[String]) -> Option<&str> {
         }
     }
     remotes.first().map(|r| r.as_str())
-}
-
-fn run_git_vec(dir: &Path, args: &[String]) -> Result<()> {
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .context("run git")?;
-    if !status.success() {
-        return Err(anyhow!("git command failed"));
-    }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -22,11 +22,9 @@ _wrt() {
         'new[Create a new worktree]' \
         'db[Run database utilities]' \
         'ls[List tracked worktrees]' \
-        'list[Alias for ls]' \
         'path[Print worktree path]' \
         'env[Print exports for a worktree]' \
         'rm[Remove a worktree]' \
-        'remove[Alias for rm]' \
         'prune[Prune git worktrees and state]' \
         'run[Run a command in a worktree]' \
         'completions[Generate zsh completions]'
@@ -34,7 +32,7 @@ _wrt() {
       ;;
     args)
       case $words[2] in
-        rm|remove)
+        rm)
           _arguments -C \
             '1:worktree:_wrt_worktrees' \
             '--force[Force remove]' \

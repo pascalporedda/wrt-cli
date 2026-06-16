@@ -696,7 +696,6 @@ dependencies = [
  "chrono",
  "clap",
  "predicates",
- "regex",
  "serde",
  "serde_json",
  "tempfile",
