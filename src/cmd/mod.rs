@@ -1,5 +1,6 @@
 mod db;
 mod env;
+mod housekeeping;
 mod init;
 mod ls;
 mod new;
@@ -9,6 +10,7 @@ mod run;
 
 pub use db::cmd_db;
 pub use env::{cmd_env, cmd_path};
+pub use housekeeping::cmd_housekeeping;
 pub use init::cmd_init;
 pub use ls::cmd_ls;
 pub use new::{cmd_new, NewOpts};

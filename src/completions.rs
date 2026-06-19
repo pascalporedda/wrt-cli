@@ -26,6 +26,7 @@ _wrt() {
         'env[Print exports for a worktree]' \
         'rm[Remove a worktree]' \
         'prune[Prune git worktrees and state]' \
+        'housekeeping[Clean old unused branches]' \
         'run[Run a command in a worktree]' \
         'completions[Generate zsh completions]'
       return
@@ -75,6 +76,10 @@ _wrt() {
             '--force[Overwrite existing .wrt.json]' \
             '--print[Print config and exit]' \
             '--model=[Codex model]:model:'
+          return
+          ;;
+        housekeeping)
+          _arguments '--apply[Delete candidates]'
           return
           ;;
         completions)

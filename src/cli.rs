@@ -11,6 +11,7 @@ Usage:
   wrt env [<name>]
   wrt rm <name> [--force] [--delete-branch]
   wrt prune
+  wrt housekeeping [--apply]
   wrt run <name> -- <command> [args...]
   wrt completions zsh
 
@@ -95,6 +96,14 @@ pub enum Cmd {
 
     /// Prune git worktrees and state
     Prune,
+
+    /// Clean old merged branches not attached to worktrees
+    Housekeeping {
+        /// Delete candidates instead of printing a dry-run
+        #[arg(long)]
+        apply: bool,
+    },
+
     /// Run a command inside a worktree with WRT_* env vars set
     ///
     /// Must be invoked as: wrt run <name> -- <command> [args...]

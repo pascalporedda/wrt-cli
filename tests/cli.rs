@@ -576,6 +576,234 @@ fn prune_removes_missing_worktrees_from_state() {
 }
 
 #[test]
+fn housekeeping_dry_run_lists_merged_unattached_branches() {
+    let td = init_repo();
+    git(td.path(), &["branch", "-M", "main"]);
+
+    git(td.path(), &["checkout", "-b", "feature/local"]);
+    fs::write(td.path().join("LOCAL.txt"), "local\n").unwrap();
+    git(td.path(), &["add", "LOCAL.txt"]);
+    git(
+        td.path(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-m",
+            "local",
+        ],
+    );
+    git(td.path(), &["checkout", "main"]);
+    git(
+        td.path(),
+        &["merge", "--no-ff", "feature/local", "-m", "merge local"],
+    );
+
+    git(td.path(), &["checkout", "-b", "feature/attached"]);
+    fs::write(td.path().join("ATTACHED.txt"), "attached\n").unwrap();
+    git(td.path(), &["add", "ATTACHED.txt"]);
+    git(
+        td.path(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-m",
+            "attached",
+        ],
+    );
+    git(td.path(), &["checkout", "main"]);
+    git(
+        td.path(),
+        &[
+            "merge",
+            "--no-ff",
+            "feature/attached",
+            "-m",
+            "merge attached",
+        ],
+    );
+    git(
+        td.path(),
+        &["worktree", "add", ".worktrees/attached", "feature/attached"],
+    );
+
+    wrt_cmd()
+        .current_dir(td.path())
+        .arg("housekeeping")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "local feature/local: merged into main, not attached to a worktree",
+        ))
+        .stdout(predicate::str::contains("feature/attached").not());
+}
+
+#[test]
+fn housekeeping_apply_deletes_local_and_remote_candidates() {
+    let td = init_repo();
+    let origin = TempDir::new().unwrap();
+    git(td.path(), &["branch", "-M", "main"]);
+    git(origin.path(), &["init", "--bare"]);
+    git(
+        td.path(),
+        &["remote", "add", "origin", origin.path().to_str().unwrap()],
+    );
+    git(td.path(), &["push", "-u", "origin", "main"]);
+
+    git(td.path(), &["checkout", "-b", "feature/local"]);
+    fs::write(td.path().join("LOCAL.txt"), "local\n").unwrap();
+    git(td.path(), &["add", "LOCAL.txt"]);
+    git(
+        td.path(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-m",
+            "local",
+        ],
+    );
+    git(td.path(), &["checkout", "main"]);
+    git(
+        td.path(),
+        &["merge", "--no-ff", "feature/local", "-m", "merge local"],
+    );
+
+    git(td.path(), &["checkout", "-b", "feature/remote"]);
+    fs::write(td.path().join("REMOTE.txt"), "remote\n").unwrap();
+    git(td.path(), &["add", "REMOTE.txt"]);
+    git(
+        td.path(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-m",
+            "remote",
+        ],
+    );
+    git(td.path(), &["push", "-u", "origin", "feature/remote"]);
+    git(td.path(), &["checkout", "main"]);
+    git(
+        td.path(),
+        &["merge", "--no-ff", "feature/remote", "-m", "merge remote"],
+    );
+    git(td.path(), &["push", "origin", "main"]);
+    git(td.path(), &["branch", "-D", "feature/remote"]);
+
+    wrt_cmd()
+        .current_dir(td.path())
+        .args(["housekeeping", "--apply"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "local feature/local: merged into main, not attached to a worktree",
+        ))
+        .stdout(predicate::str::contains(
+            "remote origin/feature/remote: merged into main, not attached to a worktree",
+        ));
+
+    let local = StdCommand::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/feature/local",
+        ])
+        .current_dir(td.path())
+        .status()
+        .unwrap();
+    assert!(!local.success());
+
+    let remote = StdCommand::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/remotes/origin/feature/remote",
+        ])
+        .current_dir(td.path())
+        .status()
+        .unwrap();
+    assert!(!remote.success());
+}
+
+#[test]
+fn housekeeping_apply_warns_and_continues_when_remote_ref_is_stale() {
+    let td = init_repo();
+    let origin = TempDir::new().unwrap();
+    git(td.path(), &["branch", "-M", "main"]);
+    git(origin.path(), &["init", "--bare"]);
+    git(
+        td.path(),
+        &["remote", "add", "origin", origin.path().to_str().unwrap()],
+    );
+    git(td.path(), &["push", "-u", "origin", "main"]);
+
+    git(td.path(), &["checkout", "-b", "feature/stale"]);
+    fs::write(td.path().join("STALE.txt"), "stale\n").unwrap();
+    git(td.path(), &["add", "STALE.txt"]);
+    git(
+        td.path(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-m",
+            "stale",
+        ],
+    );
+    git(td.path(), &["push", "-u", "origin", "feature/stale"]);
+    git(td.path(), &["checkout", "main"]);
+    git(
+        td.path(),
+        &["merge", "--no-ff", "feature/stale", "-m", "merge stale"],
+    );
+    git(td.path(), &["push", "origin", "main"]);
+    git(td.path(), &["branch", "-D", "feature/stale"]);
+    git(
+        origin.path(),
+        &["update-ref", "-d", "refs/heads/feature/stale"],
+    );
+
+    wrt_cmd()
+        .current_dir(td.path())
+        .args(["housekeeping", "--apply"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "remote origin/feature/stale: merged into main, not attached to a worktree",
+        ))
+        .stderr(predicate::str::contains(
+            "warning: skipped remote origin/feature/stale",
+        ));
+}
+
+#[test]
+fn housekeeping_prints_nothing_to_clean() {
+    let td = init_repo();
+    git(td.path(), &["branch", "-M", "main"]);
+
+    wrt_cmd()
+        .current_dir(td.path())
+        .arg("housekeeping")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("nothing to clean"));
+}
+
+#[test]
 fn run_propagates_exit_code_and_requires_separator() {
     let td = init_repo();
 

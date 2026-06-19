@@ -115,6 +115,7 @@ wrt path <name>
 wrt env [<name>]
 wrt rm <name> [--force] [--delete-branch]
 wrt prune
+wrt housekeeping [--apply]
 wrt run <name> -- <command> [args...]
 wrt completions zsh
 ```
@@ -140,6 +141,9 @@ wrt rm x --force --delete-branch
 
 # prune stale state entries after manual deletions
 wrt prune
+
+# dry-run branch cleanup; add --apply to delete candidates
+wrt housekeeping
 ```
 
 ---

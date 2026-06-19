@@ -18,8 +18,8 @@ mod worktree;
 
 use cli::{Cli, Cmd, USAGE_TEXT};
 use cmd::{
-    cmd_db, cmd_env, cmd_init, cmd_ls, cmd_new, cmd_path, cmd_prune, cmd_rm, cmd_run,
-    raw_run_has_sep, NewOpts,
+    cmd_db, cmd_env, cmd_housekeeping, cmd_init, cmd_ls, cmd_new, cmd_path, cmd_prune, cmd_rm,
+    cmd_run, raw_run_has_sep, NewOpts,
 };
 
 fn main() -> ExitCode {
@@ -136,6 +136,8 @@ fn run() -> Result<i32> {
         } => cmd_rm(&log, &repo, &mut st, &name, force, delete_branch),
 
         Cmd::Prune => cmd_prune(&log, &repo, &mut st),
+
+        Cmd::Housekeeping { apply } => cmd_housekeeping(&log, &repo, apply),
 
         Cmd::Run { name, command } => {
             if !raw_run_has_sep(&raw_args) {
