@@ -98,9 +98,9 @@ pub fn cmd_root_init(log: &ui::Logger, opts: RootInitOpts<'_>) -> Result<i32> {
     });
     st.allocations.insert("main".to_string(), alloc.clone());
     st.save(&git_dir)?;
-    let _ = gitx::ensure_info_exclude(&git_dir, &[".worktrees/", ".wrt.env", ".wrt.json"]);
+    let _ = gitx::ensure_info_exclude(&git_dir, &[".wrt.env", ".wrt.json"]);
 
-    let repo = gitx::Repo::managed(
+    let repo = gitx::Repo::new(
         root.clone(),
         git_dir.clone(),
         main_path.clone(),
@@ -141,7 +141,7 @@ pub fn cmd_root_status(log: &ui::Logger, repo: &gitx::Repo, st: &State) -> Resul
         return Ok(2);
     }
 
-    println!("layout: {}", repo.layout.as_str());
+    println!("layout: {LAYOUT_MANAGED_ROOT}");
     println!("managed root: {}", root.managed_root);
     println!("git common dir: {}", root.git_common_dir);
     println!("main worktree: {}", root.main_worktree);

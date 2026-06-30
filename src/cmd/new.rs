@@ -67,7 +67,7 @@ pub fn cmd_new(
 
     worktree::ensure_dir(wt_path.parent().unwrap())?;
 
-    if let Err(e) = worktree::add(&repo.root, &wt_path, &br, opts.from_ref) {
+    if let Err(e) = worktree::add(&repo.common_dir, &wt_path, &br, opts.from_ref) {
         log.errorf(&format!("git worktree add failed: {e}"));
         return Ok(1);
     }

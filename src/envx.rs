@@ -27,11 +27,7 @@ pub fn vars(repo: &Repo, alloc: &Allocation) -> BTreeMap<String, String> {
     );
     vars.insert(
         "WRT_MAIN_PATH".into(),
-        repo.main_worktree
-            .as_ref()
-            .unwrap_or(&repo.config_root)
-            .to_string_lossy()
-            .to_string(),
+        repo.main_worktree.to_string_lossy().to_string(),
     );
     vars.insert(
         "COMPOSE_PROJECT_NAME".into(),
@@ -177,7 +173,7 @@ fn is_valid_env_name(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gitx::{Repo, RepoLayout};
+    use crate::gitx::Repo;
     use crate::state::Allocation;
     use tempfile::TempDir;
 
@@ -185,12 +181,11 @@ mod tests {
         Repo {
             root: root.to_path_buf(),
             common_dir: root.join(".git"),
-            layout: RepoLayout::Legacy,
             managed_root: root.to_path_buf(),
             invocation_root: Some(root.to_path_buf()),
             config_root: root.to_path_buf(),
-            main_worktree: None,
-            worktree_parent: root.join(".worktrees"),
+            main_worktree: root.to_path_buf(),
+            worktree_parent: root.to_path_buf(),
         }
     }
 

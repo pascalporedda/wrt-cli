@@ -1,7 +1,9 @@
 use anyhow::{anyhow, Context, Result};
+use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::{self, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output};
 
 pub fn slug(s: &str) -> String {
     let mut out = String::new();
@@ -38,18 +40,18 @@ pub fn ensure_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn add(repo_root: &Path, wt_path: &Path, branch: &str, from_ref: &str) -> Result<()> {
-    let remotes = list_remotes(repo_root)?;
+pub fn add(git_dir: &Path, wt_path: &Path, branch: &str, from_ref: &str) -> Result<()> {
+    let remotes = list_remotes(git_dir)?;
     let remote = pick_remote(&remotes);
 
     if let Some(remote) = remote {
-        run_git(repo_root, ["fetch", "--prune", remote])
+        run_git(git_dir, ["fetch", "--prune", remote])
             .with_context(|| format!("git fetch --prune {remote}"))?;
     }
 
     // Prefer existing local branch. If it doesn't exist, check for upstream.
     if git_ok(
-        repo_root,
+        git_dir,
         [
             "show-ref",
             "--verify",
@@ -58,7 +60,7 @@ pub fn add(repo_root: &Path, wt_path: &Path, branch: &str, from_ref: &str) -> Re
         ],
     )? {
         return run_git(
-            repo_root,
+            git_dir,
             [
                 "worktree",
                 "add",
@@ -71,16 +73,13 @@ pub fn add(repo_root: &Path, wt_path: &Path, branch: &str, from_ref: &str) -> Re
     if let Some(remote) = remote {
         let remote_ref = format!("refs/remotes/{remote}/{branch}");
         if git_ok(
-            repo_root,
+            git_dir,
             ["show-ref", "--verify", "--quiet", remote_ref.as_str()],
         )? {
             let start_point = format!("{remote}/{branch}");
-            run_git(
-                repo_root,
-                ["branch", "--track", branch, start_point.as_str()],
-            )?;
+            run_git(git_dir, ["branch", "--track", branch, start_point.as_str()])?;
             return run_git(
-                repo_root,
+                git_dir,
                 [
                     "worktree",
                     "add",
@@ -92,7 +91,7 @@ pub fn add(repo_root: &Path, wt_path: &Path, branch: &str, from_ref: &str) -> Re
     }
 
     run_git(
-        repo_root,
+        git_dir,
         [
             "worktree",
             "add",
@@ -104,13 +103,17 @@ pub fn add(repo_root: &Path, wt_path: &Path, branch: &str, from_ref: &str) -> Re
     )
 }
 
-pub fn remove(repo_root: &Path, wt_path: &Path, force: bool) -> Result<()> {
+pub fn remove(git_dir: &Path, wt_path: &Path, force: bool) -> Result<()> {
     let mut args: Vec<String> = vec!["worktree".into(), "remove".into()];
     if force {
         args.push("--force".into());
     }
     args.push(wt_path.to_string_lossy().to_string());
-    run_git(repo_root, args)
+    run_git(git_dir, args)
+}
+
+pub fn delete_branch(git_dir: &Path, branch: &str) -> Result<()> {
+    run_git(git_dir, ["branch", "-D", branch])
 }
 
 pub fn is_dirty(wt_path: &Path) -> Result<bool> {
@@ -149,55 +152,104 @@ fn copy_repo_file(repo_root: &Path, wt_path: &Path, file_name: &str) -> Result<b
 fn run_git<I, S>(dir: &Path, args: I) -> Result<()>
 where
     I: IntoIterator<Item = S>,
-    S: AsRef<std::ffi::OsStr>,
+    S: AsRef<OsStr>,
 {
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        // Keep output visible for troubleshooting.
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .context("run git")?;
-    if !status.success() {
-        return Err(anyhow!("git command failed"));
+    let args: Vec<OsString> = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_os_string())
+        .collect();
+    let out = run_git_output(dir, &args)?;
+    if !out.status.success() {
+        return Err(git_failure(dir, &args, &out));
     }
+    relay_output(&out);
     Ok(())
 }
 
 fn git_ok<I, S>(dir: &Path, args: I) -> Result<bool>
 where
     I: IntoIterator<Item = S>,
-    S: AsRef<std::ffi::OsStr>,
+    S: AsRef<OsStr>,
 {
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .context("run git")?;
-    Ok(status.success())
+    let args: Vec<OsString> = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_os_string())
+        .collect();
+    let out = run_git_output(dir, &args)?;
+    Ok(out.status.success())
 }
 
 fn git_out<I, S>(dir: &Path, args: I) -> Result<String>
 where
     I: IntoIterator<Item = S>,
-    S: AsRef<std::ffi::OsStr>,
+    S: AsRef<OsStr>,
 {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .context("run git")?;
+    let args: Vec<OsString> = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_os_string())
+        .collect();
+    let out = run_git_output(dir, &args)?;
     if !out.status.success() {
-        return Err(anyhow!("git command failed"));
+        return Err(git_failure(dir, &args, &out));
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-fn list_remotes(repo_root: &Path) -> Result<Vec<String>> {
-    let out = git_out(repo_root, ["remote"])?;
+fn run_git_output(git_dir: &Path, args: &[OsString]) -> Result<Output> {
+    Command::new("git")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(args)
+        .output()
+        .map_err(|e| anyhow!("run {}: {e}", git_command(git_dir, args)))
+}
+
+fn git_failure(git_dir: &Path, args: &[OsString], out: &Output) -> anyhow::Error {
+    let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    let detail = if detail.is_empty() {
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    } else {
+        detail
+    };
+    if detail.is_empty() {
+        anyhow!("{} failed with {}", git_command(git_dir, args), out.status)
+    } else {
+        anyhow!(
+            "{} failed with {}: {detail}",
+            git_command(git_dir, args),
+            out.status
+        )
+    }
+}
+
+fn git_command(git_dir: &Path, args: &[OsString]) -> String {
+    let mut parts = vec![
+        "git".to_string(),
+        "--git-dir".to_string(),
+        shellish(git_dir.as_os_str()),
+    ];
+    parts.extend(args.iter().map(|arg| shellish(arg.as_os_str())));
+    parts.join(" ")
+}
+
+fn shellish(s: &OsStr) -> String {
+    let s = s.to_string_lossy();
+    if s.chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || "-_./:=@".contains(ch))
+    {
+        s.to_string()
+    } else {
+        format!("{s:?}")
+    }
+}
+
+fn relay_output(out: &Output) {
+    let _ = io::stdout().write_all(&out.stdout);
+    let _ = io::stderr().write_all(&out.stderr);
+}
+
+fn list_remotes(git_dir: &Path) -> Result<Vec<String>> {
+    let out = git_out(git_dir, ["remote"])?;
     Ok(out
         .lines()
         .map(|line| line.trim().to_string())

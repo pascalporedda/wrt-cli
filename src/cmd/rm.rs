@@ -36,14 +36,14 @@ pub fn cmd_rm(
         }
     }
 
-    if let Err(e) = worktree::remove(&repo.root, wt_path, force) {
+    if let Err(e) = worktree::remove(&repo.common_dir, wt_path, force) {
         log.errorf(&format!("git worktree remove failed: {e}"));
         return Ok(1);
     }
 
     if delete_branch {
         log.infof(&format!("deleting branch: {}", a.branch));
-        if let Err(e) = run_cmd(&repo.root, "git", &["branch", "-D", &a.branch]) {
+        if let Err(e) = worktree::delete_branch(&repo.common_dir, &a.branch) {
             log.errorf(&format!("branch delete failed: {e}"));
             return Ok(1);
         }

@@ -6,50 +6,37 @@ use std::process::Command;
 #[derive(Clone, Debug)]
 pub struct Repo {
     /// Directory used for normal git commands and repo-local config.
-    ///
-    /// Legacy mode: the primary checkout root.
-    /// Managed-root mode: the `<managed-root>/main` checkout.
+    /// Usually `<managed-root>/main`, but falls back to another linked checkout if main is absent.
     pub root: PathBuf,
     pub common_dir: PathBuf,
-    pub layout: RepoLayout,
     pub managed_root: PathBuf,
     pub invocation_root: Option<PathBuf>,
     pub config_root: PathBuf,
-    pub main_worktree: Option<PathBuf>,
+    pub main_worktree: PathBuf,
     pub worktree_parent: PathBuf,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RepoLayout {
-    Legacy,
-    ManagedRoot,
-}
-
-impl RepoLayout {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            RepoLayout::Legacy => "legacy",
-            RepoLayout::ManagedRoot => "managed-root",
-        }
-    }
-}
-
 impl Repo {
-    pub fn managed(
+    pub fn new(
         managed_root: PathBuf,
         common_dir: PathBuf,
         main_worktree: PathBuf,
         worktree_parent: PathBuf,
         invocation_root: Option<PathBuf>,
     ) -> Repo {
+        let root = command_root(
+            &common_dir,
+            &managed_root,
+            &main_worktree,
+            invocation_root.as_deref(),
+        );
         Repo {
-            root: main_worktree.clone(),
+            root: root.clone(),
             common_dir,
-            layout: RepoLayout::ManagedRoot,
             managed_root,
             invocation_root,
-            config_root: main_worktree.clone(),
-            main_worktree: Some(main_worktree),
+            config_root: root,
+            main_worktree,
             worktree_parent,
         }
     }
@@ -79,45 +66,10 @@ pub fn detect_repo(cwd: &Path) -> Result<Repo> {
         common_dir = workdir_root.join(common_dir);
     }
 
-    if let Some(meta) = ManagedRootMeta::read(&common_dir) {
-        let managed_root = meta
-            .managed_root
-            .or_else(|| common_dir.parent().map(Path::to_path_buf))
-            .unwrap_or_else(|| workdir_root.clone());
-        let main_worktree = meta
-            .main_worktree
-            .unwrap_or_else(|| managed_root.join("main"));
-        let worktree_parent = meta.worktrees_path.unwrap_or_else(|| managed_root.clone());
-        return Ok(Repo::managed(
-            managed_root,
-            common_dir,
-            main_worktree,
-            worktree_parent,
-            Some(invocation_root),
-        ));
-    }
-
-    // When invoked from inside a legacy git worktree, `--show-toplevel` points at the linked
-    // worktree root, but wrt's runtime artifacts and config live at the main workdir root
-    // (parent of the common git dir, typically `<repo>/.git`).
-    let root = match common_dir.file_name().and_then(|s| s.to_str()) {
-        Some(".git") => common_dir
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or(workdir_root),
-        _ => workdir_root,
-    };
-
-    Ok(Repo {
-        worktree_parent: root.join(".worktrees"),
-        config_root: root.clone(),
-        managed_root: root.clone(),
-        invocation_root: Some(invocation_root),
-        root,
-        common_dir,
-        layout: RepoLayout::Legacy,
-        main_worktree: None,
-    })
+    let meta = ManagedRootMeta::read(&common_dir).ok_or_else(|| {
+        anyhow!("not a wrt managed root; run `wrt clone <repo>` or `wrt root init <source> --root <dir>`")
+    })?;
+    Ok(repo_from_meta(meta, common_dir, Some(invocation_root)))
 }
 
 pub fn ensure_info_exclude(common_dir: &Path, patterns: &[&str]) -> Result<()> {
@@ -189,7 +141,7 @@ fn detect_managed_root_container(cwd: &Path) -> Result<Option<Repo>> {
         .main_worktree
         .unwrap_or_else(|| managed_root.join("main"));
     let worktree_parent = meta.worktrees_path.unwrap_or_else(|| managed_root.clone());
-    Ok(Some(Repo::managed(
+    Ok(Some(Repo::new(
         managed_root,
         common_dir,
         main_worktree,
@@ -242,4 +194,84 @@ fn path_field(root: &serde_json::Map<String, serde_json::Value>, key: &str) -> O
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
+}
+
+fn repo_from_meta(
+    meta: ManagedRootMeta,
+    common_dir: PathBuf,
+    invocation_root: Option<PathBuf>,
+) -> Repo {
+    let managed_root = meta
+        .managed_root
+        .or_else(|| common_dir.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let main_worktree = meta
+        .main_worktree
+        .unwrap_or_else(|| managed_root.join("main"));
+    let worktree_parent = meta.worktrees_path.unwrap_or_else(|| managed_root.clone());
+    Repo::new(
+        managed_root,
+        common_dir,
+        main_worktree,
+        worktree_parent,
+        invocation_root,
+    )
+}
+
+fn command_root(
+    common_dir: &Path,
+    managed_root: &Path,
+    main_worktree: &Path,
+    invocation_root: Option<&Path>,
+) -> PathBuf {
+    if main_worktree.is_dir() {
+        return main_worktree.to_path_buf();
+    }
+
+    if let Some(invocation_root) = invocation_root {
+        if invocation_root.is_dir() {
+            return invocation_root.to_path_buf();
+        }
+    }
+
+    first_linked_worktree(common_dir, managed_root).unwrap_or_else(|| managed_root.to_path_buf())
+}
+
+fn first_linked_worktree(common_dir: &Path, managed_root: &Path) -> Option<PathBuf> {
+    let out = Command::new("git")
+        .arg("--git-dir")
+        .arg(common_dir)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut path: Option<PathBuf> = None;
+    let mut bare = false;
+
+    for line in text.lines().chain(std::iter::once("")) {
+        if line.is_empty() {
+            if !bare {
+                if let Some(path) = path.take() {
+                    if path != managed_root && path.is_dir() {
+                        return Some(path);
+                    }
+                }
+            }
+            path = None;
+            bare = false;
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("worktree ") {
+            path = Some(PathBuf::from(value));
+        } else if line == "bare" {
+            bare = true;
+        }
+    }
+
+    None
 }
