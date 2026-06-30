@@ -226,4 +226,43 @@ mod tests {
         assert_eq!(vars.get("APP_URL").unwrap(), "http://localhost:3100");
         assert_eq!(vars.get("WRT_SERVICE_WEB_APP_PORT").unwrap(), "3100");
     }
+
+    #[test]
+    fn checkout_config_overrides_managed_root_config() {
+        let td = TempDir::new().unwrap();
+        let checkout = td.path().join("feature");
+        fs::create_dir_all(&checkout).unwrap();
+        fs::write(
+            td.path().join(".wrt.json"),
+            r#"{
+  "version": 1,
+  "port_block_size": 100,
+  "package_manager": { "name": "unknown", "install_command": ["npm","install"], "notes": null },
+  "services": [{ "name": "web app", "kind": "web", "dev_command": ["npm","run","dev"], "base_port": 3000, "port_env": "PORT", "url_env": "APP_URL", "notes": null }],
+  "database": { "detected": false, "kind": null, "migrate_command": null, "seed_command": null, "reset_command": null, "notes": null },
+  "supabase": { "detected": false, "config_path": null, "start_command": null, "base_ports": null, "notes": null },
+  "notes": null
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            checkout.join(".wrt.json"),
+            r#"{
+  "version": 1,
+  "port_block_size": 100,
+  "package_manager": { "name": "unknown", "install_command": ["npm","install"], "notes": null },
+  "services": [{ "name": "web app", "kind": "web", "dev_command": ["npm","run","dev"], "base_port": 4000, "port_env": "PORT", "url_env": "APP_URL", "notes": null }],
+  "database": { "detected": false, "kind": null, "migrate_command": null, "seed_command": null, "reset_command": null, "notes": null },
+  "supabase": { "detected": false, "config_path": null, "start_command": null, "base_ports": null, "notes": null },
+  "notes": null
+}
+"#,
+        )
+        .unwrap();
+
+        let vars = vars(&repo(td.path()), &alloc(&checkout));
+        assert_eq!(vars.get("PORT").unwrap(), "4100");
+        assert_eq!(vars.get("APP_URL").unwrap(), "http://localhost:4100");
+    }
 }

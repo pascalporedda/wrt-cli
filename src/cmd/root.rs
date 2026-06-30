@@ -99,7 +99,7 @@ pub fn cmd_root_init(log: &ui::Logger, opts: RootInitOpts<'_>) -> Result<i32> {
         return Ok(1);
     }
 
-    copy_source_overlays(opts.source, &main_path);
+    copy_source_overlays(opts.source, &root, &main_path);
 
     let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let alloc = Allocation {
@@ -236,7 +236,7 @@ fn default_branch(git_dir: &Path) -> Option<String> {
         })
 }
 
-fn copy_source_overlays(source: &str, main_path: &Path) {
+fn copy_source_overlays(source: &str, managed_root: &Path, main_path: &Path) {
     let source_path = Path::new(source);
     let source_path = if source_path.is_absolute() {
         source_path.to_path_buf()
@@ -249,12 +249,16 @@ fn copy_source_overlays(source: &str, main_path: &Path) {
     if !source_path.is_dir() {
         return;
     }
-    for file_name in [".env", ".wrt.json"] {
-        let src = source_path.join(file_name);
-        let dst = main_path.join(file_name);
-        if src.is_file() && !dst.exists() {
-            let _ = fs::copy(src, dst);
-        }
+    let env_src = source_path.join(".env");
+    let env_dst = main_path.join(".env");
+    if env_src.is_file() && !env_dst.exists() {
+        let _ = fs::copy(env_src, env_dst);
+    }
+
+    let config_src = source_path.join(".wrt.json");
+    let config_dst = managed_root.join(".wrt.json");
+    if config_src.is_file() && !config_dst.exists() {
+        let _ = fs::copy(config_src, config_dst);
     }
 }
 

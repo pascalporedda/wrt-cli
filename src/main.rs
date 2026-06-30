@@ -130,7 +130,7 @@ fn run() -> Result<i32> {
             force,
             print,
             model,
-        } => cmd_init(&log, &repo.config_root, force, print, model),
+        } => cmd_init(&log, &repo.root, &repo.config_root, force, print, model),
 
         Cmd::Clone { .. } => Ok(0),
 

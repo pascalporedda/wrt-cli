@@ -44,7 +44,7 @@ The pain is always the same:
 | **Supabase isolation** | Patches `supabase/config.toml` (project_id suffix + port offsets + localhost URLs) and sets `skip-worktree` |
 | **Run inside worktree** | `wrt run <name> -- ...` runs a command in that worktree with `WRT_*` set |
 | **State tracking** | Tracks worktrees in `<git-common-dir>/.wrt/state.json` and can prune missing entries |
-| **Repo discovery (optional)** | `wrt init` can call the Codex CLI to generate `.wrt.json` for repo-local conventions |
+| **Repo discovery (optional)** | `wrt init` can call the Codex CLI to generate managed-root `.wrt.json` conventions |
 
 ---
 
@@ -58,7 +58,7 @@ cargo install --path .
 wrt clone git@github.com:org/app.git --install false --supabase false
 cd app
 
-# optional: generates .wrt.json via Codex in main
+# optional: generates shared .wrt.json via Codex at the managed root
 cd main
 wrt init
 cd ..
@@ -196,7 +196,7 @@ wrt housekeeping
   - block `0` is reserved for the main workdir; first worktree usually gets block `1` => offset `100`
 - **Environment**
   - `.wrt.env`, `wrt env`, and `wrt run` share one environment resolver
-  - generated vars include `WRT_ROOT`, `WRT_WORKTREE_PATH`, `WRT_MAIN_PATH`, `COMPOSE_PROJECT_NAME`, and discovered service port/url vars from `.wrt.json`
+  - generated vars include `WRT_ROOT`, `WRT_WORKTREE_PATH`, `WRT_MAIN_PATH`, `COMPOSE_PROJECT_NAME`, and discovered service port/url vars from checkout-local `.wrt.json` or the managed-root `.wrt.json`
 - **Git excludes**
   - `wrt` appends these to `.git/info/exclude` to reduce accidental commits:
     - `.wrt.env`
@@ -223,7 +223,7 @@ If `supabase/config.toml` exists inside the worktree, `wrt` can patch it for iso
 - `wrt run` must be invoked with `--` exactly like `wrt run <name> -- <command> ...` (otherwise it exits with code `2`)
 - `wrt env` with no `<name>` only works when you run it from inside a tracked worktree (it infers from `cwd`)
 - `wrt new --supabase auto` patches config if it sees `supabase/config.toml`, but it only runs `supabase start` if the Supabase CLI exists in `PATH`
-- `wrt clone` / `wrt root init` clone committed Git state. They copy `.env` and `.wrt.json` only when the source is a local directory and those files exist.
+- `wrt clone` / `wrt root init` clone committed Git state. They copy `.env` into `main` and `.wrt.json` into the managed root only when the source is a local directory and those files exist.
 - Worktree name slugging is intentionally strict. If your `<name>` turns into an empty slug, it becomes `wrt`
 
 ---
@@ -252,7 +252,7 @@ tests/      integration tests (temp git repos)
 
 ## Codex Discovery (`wrt init`)
 
-`wrt init` can shell out to the Codex CLI to generate a repo-local `.wrt.json` (useful if you want a shared "what services exist / which ports matter" contract for tooling).
+`wrt init` can shell out to the Codex CLI to generate a shared `.wrt.json` at the managed root (useful if you want a shared "what services exist / which ports matter" contract for tooling). A checkout-local `.wrt.json` takes precedence when present.
 
 Offline testing:
 

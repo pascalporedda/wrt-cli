@@ -18,7 +18,7 @@ _wrt() {
     cmds)
       _values 'command' \
         'help[Print usage]' \
-        'init[Generate repo-local config]' \
+        'init[Generate shared managed-root config]' \
         'clone[Clone into a managed root]' \
         'root[Manage bare-root environments]' \
         'new[Create a new worktree]' \

@@ -236,6 +236,7 @@ fn init_print_uses_mock_output() {
         .stdout(predicate::str::contains("\"version\": 1"));
 
     assert!(!main.join(".wrt.json").exists());
+    assert!(!td.path().join(".wrt.json").exists());
 }
 
 #[test]
@@ -257,8 +258,9 @@ fn init_writes_config_and_respects_force() {
         .assert()
         .success();
 
-    let out_path = main.join(".wrt.json");
+    let out_path = td.path().join(".wrt.json");
     assert!(out_path.exists());
+    assert!(!main.join(".wrt.json").exists());
     let s = fs::read_to_string(&out_path).unwrap();
     assert!(s.contains("\"version\": 1"));
     assert!(s.ends_with('\n'));
@@ -279,6 +281,38 @@ fn init_writes_config_and_respects_force() {
         .args(["init", "--force"])
         .assert()
         .success();
+}
+
+#[test]
+fn env_reads_managed_root_config_when_checkout_has_none() {
+    let (_source, td) = init_managed_repo();
+    let main = main_path(&td);
+    assert!(!main.join(".wrt.json").exists());
+
+    fs::write(
+        td.path().join(".wrt.json"),
+        r#"{
+  "version": 1,
+  "port_block_size": 100,
+  "package_manager": { "name": "unknown", "install_command": ["npm","install"], "notes": null },
+  "services": [{ "name": "web", "kind": "web", "dev_command": ["npm","run","dev"], "base_port": 3000, "port_env": "PORT", "url_env": "APP_URL", "notes": null }],
+  "database": { "detected": false, "kind": null, "migrate_command": null, "seed_command": null, "reset_command": null, "notes": null },
+  "supabase": { "detected": false, "config_path": null, "start_command": null, "base_ports": null, "notes": null },
+  "notes": null
+}
+"#,
+    )
+    .unwrap();
+
+    wrt_cmd()
+        .current_dir(&main)
+        .args(["env", "main"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("export PORT='3000'"))
+        .stdout(predicate::str::contains(
+            "export APP_URL='http://localhost:3000'",
+        ));
 }
 
 #[test]
@@ -365,6 +399,7 @@ fn root_init_status_and_new_use_sibling_worktrees() {
 
     let main = managed.path().join("main");
     assert!(managed.path().join(".git").is_dir());
+    assert!(managed.path().join(".wrt.json").exists());
     assert!(main.join("README.md").exists());
     assert!(main.join(".wrt.env").exists());
     assert_eq!(fs::read_to_string(main.join(".env")).unwrap(), "FOO=bar\n");
@@ -678,7 +713,8 @@ JSON
     let staging = worktree_path(&td, "staging");
     let actual_pwd = PathBuf::from(fs::read_to_string(pwd_log).unwrap().trim()).canonicalize();
     assert_eq!(actual_pwd.unwrap(), staging.canonicalize().unwrap());
-    assert!(staging.join(".wrt.json").exists());
+    assert!(td.path().join(".wrt.json").exists());
+    assert!(!staging.join(".wrt.json").exists());
     assert!(!main_path(&td).join(".wrt.json").exists());
 }
 

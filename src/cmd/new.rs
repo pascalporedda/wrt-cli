@@ -125,13 +125,13 @@ pub fn setup_existing_worktree(
     wt_path: &Path,
     modes: SetupModes<'_>,
 ) -> Result<()> {
-    match worktree::copy_repo_env(&repo.config_root, wt_path) {
-        Ok(true) => log.infof("copied .env from config worktree"),
+    match worktree::copy_repo_env(&repo.root, wt_path) {
+        Ok(true) => log.infof("copied .env from command worktree"),
         Ok(false) => {}
         Err(e) => log.infof(&format!("copy .env failed: {e}")),
     }
     match worktree::copy_repo_config(&repo.config_root, wt_path) {
-        Ok(true) => log.infof("copied .wrt.json from config worktree"),
+        Ok(true) => log.infof("copied .wrt.json from managed root"),
         Ok(false) => {}
         Err(e) => log.infof(&format!("copy .wrt.json failed: {e}")),
     }

@@ -5,12 +5,13 @@ use std::process::Command;
 
 #[derive(Clone, Debug)]
 pub struct Repo {
-    /// Directory used for normal git commands and repo-local config.
+    /// Directory used for normal git commands.
     /// Usually `<managed-root>/main`, but falls back to another linked checkout if main is absent.
     pub root: PathBuf,
     pub common_dir: PathBuf,
     pub managed_root: PathBuf,
     pub invocation_root: Option<PathBuf>,
+    /// Directory for shared wrt config such as `.wrt.json`.
     pub config_root: PathBuf,
     pub main_worktree: PathBuf,
     pub worktree_parent: PathBuf,
@@ -30,12 +31,13 @@ impl Repo {
             &main_worktree,
             invocation_root.as_deref(),
         );
+        let config_root = managed_root.clone();
         Repo {
             root: root.clone(),
             common_dir,
             managed_root,
             invocation_root,
-            config_root: root,
+            config_root,
             main_worktree,
             worktree_parent,
         }

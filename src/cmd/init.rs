@@ -8,12 +8,13 @@ use crate::ui;
 
 pub fn cmd_init(
     log: &ui::Logger,
-    repo_root: &Path,
+    discovery_root: &Path,
+    output_root: &Path,
     force: bool,
     print_only: bool,
     model: Option<String>,
 ) -> Result<i32> {
-    let out_path = repo_root.join(".wrt.json");
+    let out_path = output_root.join(".wrt.json");
     if !print_only && !force && out_path.exists() {
         log.errorf(&format!(
             "{} already exists (use --force to overwrite)",
@@ -24,7 +25,7 @@ pub fn cmd_init(
 
     log.infof("running codex discovery (writes .wrt.json config)");
     let (raw, _) = match codex::discover(codex::DiscoverOpts {
-        repo_root: repo_root.to_path_buf(),
+        repo_root: discovery_root.to_path_buf(),
         model,
     }) {
         Ok(v) => v,

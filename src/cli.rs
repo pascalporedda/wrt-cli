@@ -42,7 +42,7 @@ pub enum Cmd {
     /// Print usage
     Help,
 
-    /// Generate repo-local config via Codex (writes .wrt.json)
+    /// Generate shared managed-root config via Codex (writes .wrt.json)
     Init {
         #[arg(long)]
         force: bool,
