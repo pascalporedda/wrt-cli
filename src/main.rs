@@ -19,8 +19,9 @@ mod worktree;
 
 use cli::{Cli, Cmd, RootAction, USAGE_TEXT};
 use cmd::{
-    cmd_db, cmd_env, cmd_housekeeping, cmd_init, cmd_ls, cmd_new, cmd_path, cmd_prune, cmd_rm,
-    cmd_root_init, cmd_root_status, cmd_run, raw_run_has_sep, NewOpts, RootInitOpts,
+    cmd_clone, cmd_db, cmd_env, cmd_housekeeping, cmd_init, cmd_ls, cmd_new, cmd_path, cmd_prune,
+    cmd_rm, cmd_root_init, cmd_root_status, cmd_run, raw_run_has_sep, CloneOpts, NewOpts,
+    RootInitOpts,
 };
 
 fn main() -> ExitCode {
@@ -56,6 +57,24 @@ fn run() -> Result<i32> {
             log.errorf("unsupported shell (only zsh is available)");
             return Ok(2);
         }
+        Cmd::Clone {
+            source,
+            root,
+            main,
+            install,
+            supabase,
+            db,
+        } => {
+            let opts = CloneOpts {
+                source: &source,
+                root: root.as_deref(),
+                main: main.as_deref(),
+                install_mode: &install,
+                sb_mode: &supabase,
+                db_mode: &db,
+            };
+            return cmd_clone(&log, opts);
+        }
         Cmd::Root {
             action:
                 RootAction::Init {
@@ -84,12 +103,14 @@ fn run() -> Result<i32> {
     let repo = match gitx::detect_repo(&cwd) {
         Ok(r) => r,
         Err(e) => {
-            log.errorf(&format!("not a git repo (or git not available): {e}"));
+            log.errorf(&format!(
+                "not a wrt managed root (or git not available): {e}"
+            ));
             return Ok(2);
         }
     };
 
-    let _ = gitx::ensure_info_exclude(&repo.common_dir, &[".worktrees/", ".wrt.env", ".wrt.json"]);
+    let _ = gitx::ensure_info_exclude(&repo.common_dir, &[".wrt.env", ".wrt.json"]);
 
     let mut st = match state::State::load(&repo.common_dir) {
         Ok(s) => s,
@@ -110,6 +131,8 @@ fn run() -> Result<i32> {
             print,
             model,
         } => cmd_init(&log, &repo.config_root, force, print, model),
+
+        Cmd::Clone { .. } => Ok(0),
 
         Cmd::Root {
             action: RootAction::Status,

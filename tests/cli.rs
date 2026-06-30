@@ -1,6 +1,6 @@
 use predicates::prelude::*;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use tempfile::TempDir;
 
@@ -23,6 +23,21 @@ fn git_out(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
+fn set_origin_with_remote_tracking(repo: &Path, origin: &Path) {
+    git(
+        repo,
+        &["remote", "set-url", "origin", origin.to_str().unwrap()],
+    );
+    git(
+        repo,
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+    );
+}
+
 fn init_repo() -> TempDir {
     let td = TempDir::new().unwrap();
     git(td.path(), &["init"]);
@@ -41,6 +56,99 @@ fn init_repo() -> TempDir {
         ],
     );
     td
+}
+
+fn init_managed_repo() -> (TempDir, TempDir) {
+    init_managed_from(init_repo())
+}
+
+fn init_managed_from(source: TempDir) -> (TempDir, TempDir) {
+    let root = TempDir::new().unwrap();
+    let mut cmd = wrt_cmd();
+    cmd.current_dir(source.path()).args([
+        "root",
+        "init",
+        source.path().to_str().unwrap(),
+        "--root",
+        root.path().to_str().unwrap(),
+        "--install",
+        "false",
+        "--supabase",
+        "false",
+        "--db",
+        "false",
+    ]);
+    set_minimal_path(&mut cmd);
+    cmd.assert().success();
+    (source, root)
+}
+
+fn init_bare_managed_without_main() -> (TempDir, TempDir) {
+    let source = init_repo();
+    let root = TempDir::new().unwrap();
+    let git_dir = root.path().join(".git");
+    git(
+        source.path(),
+        &[
+            "clone",
+            "--bare",
+            source.path().to_str().unwrap(),
+            git_dir.to_str().unwrap(),
+        ],
+    );
+
+    let state_dir = git_dir.join(".wrt");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.json"),
+        format!(
+            r#"{{
+  "version": 2,
+  "root": {{
+    "layout": "managed-root",
+    "managedRoot": "{root}",
+    "gitCommonDir": "{git_dir}",
+    "mainWorktree": "{main}",
+    "worktreesPath": "{root}",
+    "createdAt": "2026-06-30T00:00:00Z"
+  }},
+  "allocations": {{}}
+}}
+"#,
+            root = root.path().to_string_lossy(),
+            git_dir = git_dir.to_string_lossy(),
+            main = root.path().join("main").to_string_lossy(),
+        ),
+    )
+    .unwrap();
+
+    (source, root)
+}
+
+fn init_bare_managed_with_staging_checkout_without_main() -> (TempDir, TempDir) {
+    let (source, root) = init_bare_managed_without_main();
+    let git_dir = root.path().join(".git");
+    let staging = root.path().join("staging");
+    git(
+        root.path(),
+        &[
+            "--git-dir",
+            git_dir.to_str().unwrap(),
+            "worktree",
+            "add",
+            staging.to_str().unwrap(),
+            "main",
+        ],
+    );
+    (source, root)
+}
+
+fn main_path(root: &TempDir) -> PathBuf {
+    root.path().join("main")
+}
+
+fn worktree_path(root: &TempDir, name: &str) -> PathBuf {
+    root.path().join(name)
 }
 
 fn wrt_cmd() -> assert_cmd::Command {
@@ -76,26 +184,40 @@ fn help_works_outside_git_repo() {
 }
 
 #[test]
-fn ls_empty() {
+fn commands_require_managed_root() {
     let td = init_repo();
+
+    wrt_cmd()
+        .current_dir(td.path())
+        .arg("ls")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("not a wrt managed root"));
+}
+
+#[test]
+fn ls_empty() {
+    let (_source, td) = init_managed_repo();
 
     let mut cmd = wrt_cmd();
     cmd.current_dir(td.path()).arg("ls");
 
     cmd.assert()
         .success()
-        .stdout(predicate::str::contains("(no worktrees tracked by wrt)"));
+        .stdout(predicate::str::contains("main"))
+        .stdout(predicate::str::contains("block=0"));
 
     let exclude = td.path().join(".git").join("info").join("exclude");
     let ex = fs::read_to_string(exclude).unwrap();
-    assert!(ex.lines().any(|l| l.trim() == ".worktrees/"));
+    assert!(!ex.lines().any(|l| l.trim() == ".worktrees/"));
     assert!(ex.lines().any(|l| l.trim() == ".wrt.env"));
     assert!(ex.lines().any(|l| l.trim() == ".wrt.json"));
 }
 
 #[test]
 fn init_print_uses_mock_output() {
-    let td = init_repo();
+    let (_source, td) = init_managed_repo();
+    let main = main_path(&td);
 
     let mock = td.path().join("mock.json");
     fs::write(
@@ -105,7 +227,7 @@ fn init_print_uses_mock_output() {
     .unwrap();
 
     let mut cmd = wrt_cmd();
-    cmd.current_dir(td.path())
+    cmd.current_dir(&main)
         .env("WRT_CODEX_MOCK_OUTPUT", &mock)
         .args(["init", "--print"]);
 
@@ -113,12 +235,13 @@ fn init_print_uses_mock_output() {
         .success()
         .stdout(predicate::str::contains("\"version\": 1"));
 
-    assert!(!td.path().join(".wrt.json").exists());
+    assert!(!main.join(".wrt.json").exists());
 }
 
 #[test]
 fn init_writes_config_and_respects_force() {
-    let td = init_repo();
+    let (_source, td) = init_managed_repo();
+    let main = main_path(&td);
 
     let mock = td.path().join("mock.json");
     fs::write(
@@ -128,13 +251,13 @@ fn init_writes_config_and_respects_force() {
     .unwrap();
 
     wrt_cmd()
-        .current_dir(td.path())
+        .current_dir(&main)
         .env("WRT_CODEX_MOCK_OUTPUT", &mock)
         .args(["init"])
         .assert()
         .success();
 
-    let out_path = td.path().join(".wrt.json");
+    let out_path = main.join(".wrt.json");
     assert!(out_path.exists());
     let s = fs::read_to_string(&out_path).unwrap();
     assert!(s.contains("\"version\": 1"));
@@ -142,7 +265,7 @@ fn init_writes_config_and_respects_force() {
 
     // Without --force, should refuse overwrite.
     wrt_cmd()
-        .current_dir(td.path())
+        .current_dir(&main)
         .env("WRT_CODEX_MOCK_OUTPUT", &mock)
         .args(["init"])
         .assert()
@@ -151,7 +274,7 @@ fn init_writes_config_and_respects_force() {
 
     // With --force, should overwrite.
     wrt_cmd()
-        .current_dir(td.path())
+        .current_dir(&main)
         .env("WRT_CODEX_MOCK_OUTPUT", &mock)
         .args(["init", "--force"])
         .assert()
@@ -160,18 +283,18 @@ fn init_writes_config_and_respects_force() {
 
 #[test]
 fn new_patches_supabase_and_sets_skip_worktree_when_auto() {
-    let td = init_repo();
+    let source = init_repo();
 
-    let sbdir = td.path().join("supabase");
+    let sbdir = source.path().join("supabase");
     fs::create_dir_all(&sbdir).unwrap();
     fs::write(
         sbdir.join("config.toml"),
         "project_id = \"myproj\"\nport = 5432\nauth_site_url = \"http://localhost:3000\"\n",
     )
     .unwrap();
-    git(td.path(), &["add", "supabase/config.toml"]);
+    git(source.path(), &["add", "supabase/config.toml"]);
     git(
-        td.path(),
+        source.path(),
         &[
             "-c",
             "user.email=test@example.com",
@@ -182,6 +305,7 @@ fn new_patches_supabase_and_sets_skip_worktree_when_auto() {
             "add supabase",
         ],
     );
+    let (_source, td) = init_managed_from(source);
 
     let mut cmd = wrt_cmd();
     cmd.current_dir(td.path())
@@ -189,7 +313,7 @@ fn new_patches_supabase_and_sets_skip_worktree_when_auto() {
     set_minimal_path(&mut cmd);
     cmd.assert().success();
 
-    let wt_dir = td.path().join(".worktrees").join("x");
+    let wt_dir = worktree_path(&td, "x");
     let patched = fs::read_to_string(wt_dir.join("supabase").join("config.toml")).unwrap();
 
     // First allocation block is 1 => offset 100.
@@ -276,7 +400,6 @@ fn root_init_status_and_new_use_sibling_worktrees() {
 
     let feature = managed.path().join("feature-demo");
     assert!(feature.exists());
-    assert!(!main.join(".worktrees").join("feature-demo").exists());
     assert_eq!(
         fs::read_to_string(feature.join(".env")).unwrap(),
         "FOO=bar\n"
@@ -303,26 +426,68 @@ fn root_init_status_and_new_use_sibling_worktrees() {
         ));
 }
 
+#[test]
+fn clone_derives_root_and_runs_managed_setup() {
+    let source = init_repo();
+    fs::write(source.path().join(".env"), "FOO=bar\n").unwrap();
+
+    let parent = TempDir::new().unwrap();
+    let root_name = source.path().file_name().unwrap().to_string_lossy();
+    let managed = parent.path().join(root_name.as_ref());
+
+    let mut cmd = wrt_cmd();
+    cmd.current_dir(parent.path()).args([
+        "clone",
+        source.path().to_str().unwrap(),
+        "--install",
+        "false",
+        "--supabase",
+        "false",
+        "--db",
+        "false",
+    ]);
+    set_minimal_path(&mut cmd);
+    cmd.assert().success();
+
+    let main = managed.join("main");
+    assert!(managed.join(".git").is_dir());
+    assert!(main.join("README.md").exists());
+    assert!(main.join(".wrt.env").exists());
+    assert_eq!(fs::read_to_string(main.join(".env")).unwrap(), "FOO=bar\n");
+
+    wrt_cmd()
+        .current_dir(&managed)
+        .args(["root", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("layout: managed-root"))
+        .stdout(predicate::str::contains("tracked worktrees: 1"));
+}
+
 #[cfg(unix)]
 #[test]
 fn new_runs_mocked_package_install_and_supabase_lifecycle() {
-    let td = init_repo();
+    let source = init_repo();
     fs::write(
-        td.path().join("package.json"),
+        source.path().join("package.json"),
         r#"{"scripts":{"dev":"echo dev"}}"#,
     )
     .unwrap();
-    fs::write(td.path().join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
-    let sbdir = td.path().join("supabase");
+    fs::write(
+        source.path().join("pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\n",
+    )
+    .unwrap();
+    let sbdir = source.path().join("supabase");
     fs::create_dir_all(&sbdir).unwrap();
     fs::write(
         sbdir.join("config.toml"),
         "project_id = \"myproj\"\nport = 5432\n",
     )
     .unwrap();
-    git(td.path(), &["add", "."]);
+    git(source.path(), &["add", "."]);
     git(
-        td.path(),
+        source.path(),
         &[
             "-c",
             "user.email=test@example.com",
@@ -333,9 +498,10 @@ fn new_runs_mocked_package_install_and_supabase_lifecycle() {
             "add setup files",
         ],
     );
+    let log = source.path().join("mock.log");
+    let (_source, td) = init_managed_from(source);
 
     let bin = TempDir::new().unwrap();
-    let log = td.path().join("mock.log");
     write_mock_bin(
         bin.path(),
         "pnpm",
@@ -381,7 +547,7 @@ fn new_runs_mocked_package_install_and_supabase_lifecycle() {
 
 #[test]
 fn new_and_rm_roundtrip() {
-    let td = init_repo();
+    let (_source, td) = init_managed_repo();
 
     wrt_cmd()
         .current_dir(td.path())
@@ -398,7 +564,7 @@ fn new_and_rm_roundtrip() {
         .assert()
         .success();
 
-    let wt_dir = td.path().join(".worktrees").join("a-gpt-fix-login-timeout");
+    let wt_dir = worktree_path(&td, "a-gpt-fix-login-timeout");
     assert!(wt_dir.exists());
     assert!(wt_dir.join(".wrt.env").exists());
 
@@ -412,25 +578,130 @@ fn new_and_rm_roundtrip() {
 }
 
 #[test]
+fn add_and_remove_aliases_roundtrip() {
+    let (_source, td) = init_managed_repo();
+
+    wrt_cmd()
+        .current_dir(td.path())
+        .args([
+            "add",
+            "x",
+            "--install",
+            "false",
+            "--supabase",
+            "false",
+            "--db",
+            "false",
+        ])
+        .assert()
+        .success();
+
+    let wt_dir = worktree_path(&td, "x");
+    assert!(wt_dir.exists());
+
+    wrt_cmd()
+        .current_dir(td.path())
+        .args(["remove", "x", "--force"])
+        .assert()
+        .success();
+
+    assert!(!wt_dir.exists());
+}
+
+#[test]
+fn new_works_from_bare_managed_root_even_when_main_checkout_is_missing() {
+    let (_source, td) = init_bare_managed_without_main();
+
+    wrt_cmd()
+        .current_dir(td.path())
+        .args([
+            "new",
+            "staging",
+            "--install",
+            "false",
+            "--supabase",
+            "false",
+            "--db",
+            "false",
+        ])
+        .assert()
+        .success();
+
+    let wt_dir = worktree_path(&td, "staging");
+    assert!(wt_dir.exists());
+    assert!(wt_dir.join(".wrt.env").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn init_from_bare_managed_root_uses_existing_checkout_when_main_is_missing() {
+    let (_source, td) = init_bare_managed_with_staging_checkout_without_main();
+
+    let bin = TempDir::new().unwrap();
+    let pwd_log = td.path().join("codex-pwd.log");
+    write_mock_bin(
+        bin.path(),
+        "codex",
+        r#"#!/bin/sh
+out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then
+    shift
+    out="$1"
+  fi
+  shift || break
+done
+printf '%s\n' "$PWD" > "$CODEX_PWD_LOG"
+cat > "$out" <<'JSON'
+{
+  "version": 1,
+  "port_block_size": 100,
+  "package_manager": { "name": "unknown", "install_command": [], "notes": null },
+  "services": [],
+  "database": { "detected": false, "kind": null, "migrate_command": null, "seed_command": null, "reset_command": null, "notes": null },
+  "supabase": { "detected": false, "config_path": null, "start_command": null, "base_ports": null, "notes": null },
+  "notes": null
+}
+JSON
+"#,
+    );
+
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+    wrt_cmd()
+        .current_dir(td.path())
+        .env("PATH", path)
+        .env("CODEX_PWD_LOG", &pwd_log)
+        .args(["init"])
+        .assert()
+        .success();
+
+    let staging = worktree_path(&td, "staging");
+    let actual_pwd = PathBuf::from(fs::read_to_string(pwd_log).unwrap().trim()).canonicalize();
+    assert_eq!(actual_pwd.unwrap(), staging.canonicalize().unwrap());
+    assert!(staging.join(".wrt.json").exists());
+    assert!(!main_path(&td).join(".wrt.json").exists());
+}
+
+#[test]
 fn new_uses_upstream_branch_when_present() {
-    let td = init_repo();
+    let source = init_repo();
     let origin = TempDir::new().unwrap();
 
     git(origin.path(), &["init", "--bare"]);
     git(
-        td.path(),
+        source.path(),
         &["remote", "add", "origin", origin.path().to_str().unwrap()],
     );
 
-    let main = git_out(td.path(), &["rev-parse", "--abbrev-ref", "HEAD"]);
+    let main = git_out(source.path(), &["rev-parse", "--abbrev-ref", "HEAD"]);
     let main = main.trim();
-    git(td.path(), &["push", "-u", "origin", main]);
+    git(source.path(), &["push", "-u", "origin", main]);
 
-    git(td.path(), &["checkout", "-b", "feature/upstream"]);
-    fs::write(td.path().join("FEATURE.txt"), "hello\n").unwrap();
-    git(td.path(), &["add", "FEATURE.txt"]);
+    git(source.path(), &["checkout", "-b", "feature/upstream"]);
+    fs::write(source.path().join("FEATURE.txt"), "hello\n").unwrap();
+    git(source.path(), &["add", "FEATURE.txt"]);
     git(
-        td.path(),
+        source.path(),
         &[
             "-c",
             "user.email=test@example.com",
@@ -441,10 +712,14 @@ fn new_uses_upstream_branch_when_present() {
             "feature",
         ],
     );
-    git(td.path(), &["push", "-u", "origin", "feature/upstream"]);
+    git(source.path(), &["push", "-u", "origin", "feature/upstream"]);
 
-    git(td.path(), &["checkout", main]);
-    git(td.path(), &["branch", "-D", "feature/upstream"]);
+    git(source.path(), &["checkout", main]);
+    git(source.path(), &["branch", "-D", "feature/upstream"]);
+    let (_source, td) = init_managed_from(source);
+    let main_path = main_path(&td);
+    set_origin_with_remote_tracking(&main_path, origin.path());
+    git(&main_path, &["fetch", "origin"]);
 
     let mut cmd = wrt_cmd();
     cmd.current_dir(td.path()).args([
@@ -460,11 +735,11 @@ fn new_uses_upstream_branch_when_present() {
     set_minimal_path(&mut cmd);
     cmd.assert().success();
 
-    let wt_dir = td.path().join(".worktrees").join("feature-upstream");
+    let wt_dir = worktree_path(&td, "feature-upstream");
     assert!(wt_dir.join("FEATURE.txt").exists());
 
     let upstream = git_out(
-        td.path(),
+        &main_path,
         &["rev-parse", "--abbrev-ref", "feature/upstream@{upstream}"],
     );
     assert_eq!(upstream.trim(), "origin/feature/upstream");
@@ -472,9 +747,10 @@ fn new_uses_upstream_branch_when_present() {
 
 #[test]
 fn new_copies_repo_env_when_present() {
-    let td = init_repo();
+    let source = init_repo();
 
-    fs::write(td.path().join(".env"), "FOO=bar\n").unwrap();
+    fs::write(source.path().join(".env"), "FOO=bar\n").unwrap();
+    let (_source, td) = init_managed_from(source);
 
     wrt_cmd()
         .current_dir(td.path())
@@ -491,14 +767,14 @@ fn new_copies_repo_env_when_present() {
         .assert()
         .success();
 
-    let wt_env = td.path().join(".worktrees").join("x").join(".env");
+    let wt_env = worktree_path(&td, "x").join(".env");
     assert!(wt_env.exists());
     assert_eq!(fs::read_to_string(wt_env).unwrap(), "FOO=bar\n");
 }
 
 #[test]
 fn new_cd_prints_shell_cd_snippet() {
-    let td = init_repo();
+    let (_source, td) = init_managed_repo();
 
     let mut cmd = wrt_cmd();
     cmd.current_dir(td.path()).args([
@@ -515,19 +791,19 @@ fn new_cd_prints_shell_cd_snippet() {
     set_minimal_path(&mut cmd);
     cmd.assert()
         .success()
-        .stdout(predicate::str::contains("cd '").and(predicate::str::contains("/.worktrees/x'")));
+        .stdout(predicate::str::contains("cd '").and(predicate::str::contains("/x'")));
 
-    let wt_dir = td.path().join(".worktrees").join("x");
+    let wt_dir = worktree_path(&td, "x");
     assert!(wt_dir.exists());
 }
 
 #[test]
 fn new_db_auto_skips_non_interactive_and_true_runs() {
-    let td = init_repo();
+    let source = init_repo();
 
     // Repo-local config with a db reset command.
     fs::write(
-        td.path().join(".wrt.json"),
+        source.path().join(".wrt.json"),
         r#"{
   "version": 1,
   "port_block_size": 100,
@@ -547,6 +823,7 @@ fn new_db_auto_skips_non_interactive_and_true_runs() {
 "#,
     )
     .unwrap();
+    let (_source, td) = init_managed_from(source);
 
     // auto: stdin isn't a tty in tests, so it must not run the command.
     let mut cmd = wrt_cmd();
@@ -565,7 +842,7 @@ fn new_db_auto_skips_non_interactive_and_true_runs() {
         .success()
         .stderr(predicate::str::contains("skipping in non-interactive mode"));
 
-    let wt_dir = td.path().join(".worktrees").join("x");
+    let wt_dir = worktree_path(&td, "x");
     assert!(!wt_dir.join(".db_ran").exists());
 
     // true: should run without prompting (still non-interactive).
@@ -583,17 +860,17 @@ fn new_db_auto_skips_non_interactive_and_true_runs() {
     set_minimal_path(&mut cmd);
     cmd.assert().success();
 
-    let wt_dir = td.path().join(".worktrees").join("y");
+    let wt_dir = worktree_path(&td, "y");
     assert!(wt_dir.join(".db_ran").exists());
 }
 
 #[test]
 fn new_db_true_does_not_fallback_to_seed_or_migrate() {
-    let td = init_repo();
+    let source = init_repo();
 
     // Only seed is present; `wrt new --db true` should not run it.
     fs::write(
-        td.path().join(".wrt.json"),
+        source.path().join(".wrt.json"),
         r#"{
   "version": 1,
   "port_block_size": 100,
@@ -613,6 +890,7 @@ fn new_db_true_does_not_fallback_to_seed_or_migrate() {
 "#,
     )
     .unwrap();
+    let (_source, td) = init_managed_from(source);
 
     let mut cmd = wrt_cmd();
     cmd.current_dir(td.path()).args([
@@ -628,16 +906,16 @@ fn new_db_true_does_not_fallback_to_seed_or_migrate() {
     set_minimal_path(&mut cmd);
     cmd.assert().success();
 
-    let wt_dir = td.path().join(".worktrees").join("x");
+    let wt_dir = worktree_path(&td, "x");
     assert!(!wt_dir.join(".db_seed_ran").exists());
 }
 
 #[test]
 fn db_reset_requires_yes_non_interactive_and_runs_with_yes() {
-    let td = init_repo();
+    let source = init_repo();
 
     fs::write(
-        td.path().join(".wrt.json"),
+        source.path().join(".wrt.json"),
         r#"{
   "version": 1,
   "port_block_size": 100,
@@ -657,6 +935,7 @@ fn db_reset_requires_yes_non_interactive_and_runs_with_yes() {
 "#,
     )
     .unwrap();
+    let (_source, td) = init_managed_from(source);
 
     wrt_cmd()
         .current_dir(td.path())
@@ -673,7 +952,7 @@ fn db_reset_requires_yes_non_interactive_and_runs_with_yes() {
         .assert()
         .success();
 
-    let wt_dir = td.path().join(".worktrees").join("x");
+    let wt_dir = worktree_path(&td, "x");
 
     // Non-interactive test: must refuse without --yes.
     let mut cmd = wrt_cmd();
@@ -695,7 +974,7 @@ fn db_reset_requires_yes_non_interactive_and_runs_with_yes() {
 
 #[test]
 fn rm_delete_branch_removes_branch_ref() {
-    let td = init_repo();
+    let (_source, td) = init_managed_repo();
 
     wrt_cmd()
         .current_dir(td.path())
@@ -711,7 +990,7 @@ fn rm_delete_branch_removes_branch_ref() {
 
     let status = StdCommand::new("git")
         .args(["show-ref", "--verify", "--quiet", "refs/heads/x"])
-        .current_dir(td.path())
+        .current_dir(main_path(&td))
         .status()
         .unwrap();
     assert!(!status.success());
@@ -719,7 +998,7 @@ fn rm_delete_branch_removes_branch_ref() {
 
 #[test]
 fn env_infers_from_cwd() {
-    let td = init_repo();
+    let (_source, td) = init_managed_repo();
 
     wrt_cmd()
         .current_dir(td.path())
@@ -727,7 +1006,7 @@ fn env_infers_from_cwd() {
         .assert()
         .success();
 
-    let wt_dir = td.path().join(".worktrees").join("x");
+    let wt_dir = worktree_path(&td, "x");
 
     wrt_cmd()
         .current_dir(&wt_dir)
@@ -739,7 +1018,7 @@ fn env_infers_from_cwd() {
 
 #[test]
 fn prune_removes_missing_worktrees_from_state() {
-    let td = init_repo();
+    let (_source, td) = init_managed_repo();
 
     wrt_cmd()
         .current_dir(td.path())
@@ -747,7 +1026,7 @@ fn prune_removes_missing_worktrees_from_state() {
         .assert()
         .success();
 
-    let wt_dir = td.path().join(".worktrees").join("x");
+    let wt_dir = worktree_path(&td, "x");
     fs::remove_dir_all(&wt_dir).unwrap();
     assert!(!wt_dir.exists());
 
@@ -765,14 +1044,15 @@ fn prune_removes_missing_worktrees_from_state() {
 
 #[test]
 fn housekeeping_dry_run_lists_merged_unattached_branches() {
-    let td = init_repo();
-    git(td.path(), &["branch", "-M", "main"]);
+    let (_source, td) = init_managed_repo();
+    let main = main_path(&td);
+    git(&main, &["branch", "-M", "main"]);
 
-    git(td.path(), &["checkout", "-b", "feature/local"]);
-    fs::write(td.path().join("LOCAL.txt"), "local\n").unwrap();
-    git(td.path(), &["add", "LOCAL.txt"]);
+    git(&main, &["checkout", "-b", "feature/local"]);
+    fs::write(main.join("LOCAL.txt"), "local\n").unwrap();
+    git(&main, &["add", "LOCAL.txt"]);
     git(
-        td.path(),
+        &main,
         &[
             "-c",
             "user.email=test@example.com",
@@ -783,17 +1063,17 @@ fn housekeeping_dry_run_lists_merged_unattached_branches() {
             "local",
         ],
     );
-    git(td.path(), &["checkout", "main"]);
+    git(&main, &["checkout", "main"]);
     git(
-        td.path(),
+        &main,
         &["merge", "--no-ff", "feature/local", "-m", "merge local"],
     );
 
-    git(td.path(), &["checkout", "-b", "feature/attached"]);
-    fs::write(td.path().join("ATTACHED.txt"), "attached\n").unwrap();
-    git(td.path(), &["add", "ATTACHED.txt"]);
+    git(&main, &["checkout", "-b", "feature/attached"]);
+    fs::write(main.join("ATTACHED.txt"), "attached\n").unwrap();
+    git(&main, &["add", "ATTACHED.txt"]);
     git(
-        td.path(),
+        &main,
         &[
             "-c",
             "user.email=test@example.com",
@@ -804,9 +1084,9 @@ fn housekeeping_dry_run_lists_merged_unattached_branches() {
             "attached",
         ],
     );
-    git(td.path(), &["checkout", "main"]);
+    git(&main, &["checkout", "main"]);
     git(
-        td.path(),
+        &main,
         &[
             "merge",
             "--no-ff",
@@ -815,9 +1095,15 @@ fn housekeeping_dry_run_lists_merged_unattached_branches() {
             "merge attached",
         ],
     );
+    let attached = worktree_path(&td, "attached");
     git(
-        td.path(),
-        &["worktree", "add", ".worktrees/attached", "feature/attached"],
+        &main,
+        &[
+            "worktree",
+            "add",
+            attached.to_str().unwrap(),
+            "feature/attached",
+        ],
     );
 
     wrt_cmd()
@@ -833,21 +1119,19 @@ fn housekeeping_dry_run_lists_merged_unattached_branches() {
 
 #[test]
 fn housekeeping_apply_deletes_local_and_remote_candidates() {
-    let td = init_repo();
+    let (_source, td) = init_managed_repo();
+    let main = main_path(&td);
     let origin = TempDir::new().unwrap();
-    git(td.path(), &["branch", "-M", "main"]);
+    git(&main, &["branch", "-M", "main"]);
     git(origin.path(), &["init", "--bare"]);
-    git(
-        td.path(),
-        &["remote", "add", "origin", origin.path().to_str().unwrap()],
-    );
-    git(td.path(), &["push", "-u", "origin", "main"]);
+    set_origin_with_remote_tracking(&main, origin.path());
+    git(&main, &["push", "-u", "origin", "main"]);
 
-    git(td.path(), &["checkout", "-b", "feature/local"]);
-    fs::write(td.path().join("LOCAL.txt"), "local\n").unwrap();
-    git(td.path(), &["add", "LOCAL.txt"]);
+    git(&main, &["checkout", "-b", "feature/local"]);
+    fs::write(main.join("LOCAL.txt"), "local\n").unwrap();
+    git(&main, &["add", "LOCAL.txt"]);
     git(
-        td.path(),
+        &main,
         &[
             "-c",
             "user.email=test@example.com",
@@ -858,17 +1142,17 @@ fn housekeeping_apply_deletes_local_and_remote_candidates() {
             "local",
         ],
     );
-    git(td.path(), &["checkout", "main"]);
+    git(&main, &["checkout", "main"]);
     git(
-        td.path(),
+        &main,
         &["merge", "--no-ff", "feature/local", "-m", "merge local"],
     );
 
-    git(td.path(), &["checkout", "-b", "feature/remote"]);
-    fs::write(td.path().join("REMOTE.txt"), "remote\n").unwrap();
-    git(td.path(), &["add", "REMOTE.txt"]);
+    git(&main, &["checkout", "-b", "feature/remote"]);
+    fs::write(main.join("REMOTE.txt"), "remote\n").unwrap();
+    git(&main, &["add", "REMOTE.txt"]);
     git(
-        td.path(),
+        &main,
         &[
             "-c",
             "user.email=test@example.com",
@@ -879,14 +1163,15 @@ fn housekeeping_apply_deletes_local_and_remote_candidates() {
             "remote",
         ],
     );
-    git(td.path(), &["push", "-u", "origin", "feature/remote"]);
-    git(td.path(), &["checkout", "main"]);
+    git(&main, &["push", "-u", "origin", "feature/remote"]);
+    git(&main, &["checkout", "main"]);
     git(
-        td.path(),
+        &main,
         &["merge", "--no-ff", "feature/remote", "-m", "merge remote"],
     );
-    git(td.path(), &["push", "origin", "main"]);
-    git(td.path(), &["branch", "-D", "feature/remote"]);
+    git(&main, &["push", "origin", "main"]);
+    git(&main, &["branch", "-D", "feature/remote"]);
+    git(&main, &["fetch", "origin"]);
 
     wrt_cmd()
         .current_dir(td.path())
@@ -907,7 +1192,7 @@ fn housekeeping_apply_deletes_local_and_remote_candidates() {
             "--quiet",
             "refs/heads/feature/local",
         ])
-        .current_dir(td.path())
+        .current_dir(&main)
         .status()
         .unwrap();
     assert!(!local.success());
@@ -919,7 +1204,7 @@ fn housekeeping_apply_deletes_local_and_remote_candidates() {
             "--quiet",
             "refs/remotes/origin/feature/remote",
         ])
-        .current_dir(td.path())
+        .current_dir(&main)
         .status()
         .unwrap();
     assert!(!remote.success());
@@ -927,21 +1212,19 @@ fn housekeeping_apply_deletes_local_and_remote_candidates() {
 
 #[test]
 fn housekeeping_apply_warns_and_continues_when_remote_ref_is_stale() {
-    let td = init_repo();
+    let (_source, td) = init_managed_repo();
+    let main = main_path(&td);
     let origin = TempDir::new().unwrap();
-    git(td.path(), &["branch", "-M", "main"]);
+    git(&main, &["branch", "-M", "main"]);
     git(origin.path(), &["init", "--bare"]);
-    git(
-        td.path(),
-        &["remote", "add", "origin", origin.path().to_str().unwrap()],
-    );
-    git(td.path(), &["push", "-u", "origin", "main"]);
+    set_origin_with_remote_tracking(&main, origin.path());
+    git(&main, &["push", "-u", "origin", "main"]);
 
-    git(td.path(), &["checkout", "-b", "feature/stale"]);
-    fs::write(td.path().join("STALE.txt"), "stale\n").unwrap();
-    git(td.path(), &["add", "STALE.txt"]);
+    git(&main, &["checkout", "-b", "feature/stale"]);
+    fs::write(main.join("STALE.txt"), "stale\n").unwrap();
+    git(&main, &["add", "STALE.txt"]);
     git(
-        td.path(),
+        &main,
         &[
             "-c",
             "user.email=test@example.com",
@@ -952,14 +1235,15 @@ fn housekeeping_apply_warns_and_continues_when_remote_ref_is_stale() {
             "stale",
         ],
     );
-    git(td.path(), &["push", "-u", "origin", "feature/stale"]);
-    git(td.path(), &["checkout", "main"]);
+    git(&main, &["push", "-u", "origin", "feature/stale"]);
+    git(&main, &["checkout", "main"]);
     git(
-        td.path(),
+        &main,
         &["merge", "--no-ff", "feature/stale", "-m", "merge stale"],
     );
-    git(td.path(), &["push", "origin", "main"]);
-    git(td.path(), &["branch", "-D", "feature/stale"]);
+    git(&main, &["push", "origin", "main"]);
+    git(&main, &["branch", "-D", "feature/stale"]);
+    git(&main, &["fetch", "origin"]);
     git(
         origin.path(),
         &["update-ref", "-d", "refs/heads/feature/stale"],
@@ -980,8 +1264,9 @@ fn housekeeping_apply_warns_and_continues_when_remote_ref_is_stale() {
 
 #[test]
 fn housekeeping_prints_nothing_to_clean() {
-    let td = init_repo();
-    git(td.path(), &["branch", "-M", "main"]);
+    let (_source, td) = init_managed_repo();
+    let main = main_path(&td);
+    git(&main, &["branch", "-M", "main"]);
 
     wrt_cmd()
         .current_dir(td.path())
@@ -993,7 +1278,7 @@ fn housekeeping_prints_nothing_to_clean() {
 
 #[test]
 fn run_propagates_exit_code_and_requires_separator() {
-    let td = init_repo();
+    let (_source, td) = init_managed_repo();
 
     wrt_cmd()
         .current_dir(td.path())

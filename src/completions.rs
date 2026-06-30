@@ -19,13 +19,16 @@ _wrt() {
       _values 'command' \
         'help[Print usage]' \
         'init[Generate repo-local config]' \
+        'clone[Clone into a managed root]' \
         'root[Manage bare-root environments]' \
         'new[Create a new worktree]' \
+        'add[Create a new worktree]' \
         'db[Run database utilities]' \
         'ls[List tracked worktrees]' \
         'path[Print worktree path]' \
         'env[Print exports for a worktree]' \
         'rm[Remove a worktree]' \
+        'remove[Remove a worktree]' \
         'prune[Prune git worktrees and state]' \
         'housekeeping[Clean old unused branches]' \
         'run[Run a command in a worktree]' \
@@ -34,7 +37,7 @@ _wrt() {
       ;;
     args)
       case $words[2] in
-        rm)
+        rm|remove)
           _arguments -C \
             '1:worktree:_wrt_worktrees' \
             '--force[Force remove]' \
@@ -61,7 +64,7 @@ _wrt() {
             '--yes[Skip interactive prompts (reset only)]'
           return
           ;;
-        new)
+        new|add)
           _arguments -C \
             '1:name:' \
             '--from=[Start ref]:ref:' \
@@ -70,6 +73,16 @@ _wrt() {
             '--supabase=[Supabase]:mode:(auto true false)' \
             '--db=[DB setup]:mode:(auto true false)' \
             '--cd[Print cd snippet]'
+          return
+          ;;
+        clone)
+          _arguments -C \
+            '1:git repository:_files' \
+            '--root=[Managed root directory]:directory:_files -/' \
+            '--main=[Main branch]:branch:' \
+            '--install=[Install deps]:mode:(auto true false)' \
+            '--supabase=[Supabase]:mode:(auto true false)' \
+            '--db=[DB setup]:mode:(auto true false)'
           return
           ;;
         init)

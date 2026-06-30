@@ -4,22 +4,25 @@ pub const USAGE_TEXT: &str = r#"wrt: git worktree helper geared for parallel (ag
 
 Usage:
   wrt init [--force] [--print] [--model <codex-model>]
+  wrt clone <git-repo-url> [--root <dir>] [--main <branch>] [--install auto|true|false] [--supabase auto|true|false] [--db auto|true|false]
   wrt root init <source> --root <dir> [--main <branch>] [--install auto|true|false] [--supabase auto|true|false] [--db auto|true|false]
   wrt root status
   wrt new <name> [--from <ref>] [--branch <branch>] [--install auto|true|false] [--supabase auto|true|false] [--db auto|true|false] [--cd]
+  wrt add <name> [--from <ref>] [--branch <branch>] [--install auto|true|false] [--supabase auto|true|false] [--db auto|true|false] [--cd]
   wrt db [<name>] reset|seed|migrate [--print]
   wrt ls
   wrt path <name>
   wrt env [<name>]
   wrt rm <name> [--force] [--delete-branch]
+  wrt remove <name> [--force] [--delete-branch]
   wrt prune
   wrt housekeeping [--apply]
   wrt run <name> -- <command> [args...]
   wrt completions zsh
 
 Conventions:
-  - Worktrees live under: <repo>/.worktrees/<name>
   - Managed roots live under: <root>/.git + <root>/main + <root>/<feature>
+  - Feature worktrees live as siblings of main: <root>/<name>
   - Each worktree gets a reserved "port block" (offset = block*100); block 0 is kept for the main workdir.
   - If a Supabase config exists (supabase/config.toml), wrt can patch it to avoid port/container collisions.
   - If DB reset/seed commands are discovered (via .wrt.json), wrt can optionally run them after setup.
@@ -49,6 +52,21 @@ pub enum Cmd {
         model: Option<String>,
     },
 
+    /// Clone a git repo into a managed root and run setup
+    Clone {
+        source: String,
+        #[arg(long)]
+        root: Option<String>,
+        #[arg(long)]
+        main: Option<String>,
+        #[arg(long, default_value = "auto")]
+        install: String,
+        #[arg(long, default_value = "auto")]
+        supabase: String,
+        #[arg(long, default_value = "auto")]
+        db: String,
+    },
+
     /// Manage bare-root wrt environments
     Root {
         #[command(subcommand)]
@@ -56,6 +74,7 @@ pub enum Cmd {
     },
 
     /// Create a new worktree (+branch), optionally install deps and start supabase
+    #[command(visible_alias = "add")]
     New {
         name: String,
         #[arg(long, default_value = "HEAD")]
@@ -95,6 +114,7 @@ pub enum Cmd {
     Env { name: Option<String> },
 
     /// Remove a worktree
+    #[command(visible_alias = "remove")]
     Rm {
         name: String,
         #[arg(long)]

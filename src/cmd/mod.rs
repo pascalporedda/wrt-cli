@@ -17,5 +17,5 @@ pub use ls::cmd_ls;
 pub use new::{cmd_new, NewOpts};
 pub use prune::cmd_prune;
 pub use rm::cmd_rm;
-pub use root::{cmd_root_init, cmd_root_status, RootInitOpts};
+pub use root::{cmd_clone, cmd_root_init, cmd_root_status, CloneOpts, RootInitOpts};
 pub use run::{cmd_run, raw_run_has_sep};
