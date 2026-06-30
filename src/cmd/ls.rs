@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::path::Path;
 
 use crate::state::State;
+use crate::supabase;
 use crate::worktree;
 
 pub fn cmd_ls(st: &State) -> Result<i32> {
@@ -16,9 +17,14 @@ pub fn cmd_ls(st: &State) -> Result<i32> {
             Ok(false) => "clean",
             Err(_) => "?",
         };
+        let supabase = if supabase::has_config(Path::new(&a.path)) {
+            "supabase=patched"
+        } else {
+            "supabase=none"
+        };
         println!(
-            "{:<28}  block={:<3}  offset={:<4}  {:<5}  {}  ({})",
-            a.name, a.block, a.offset, dirty, a.branch, a.path
+            "{:<28}  block={:<3}  offset={:<4}  {:<8}  {:<5}  {:<17}  {}  ({})",
+            a.name, a.block, a.offset, a.status, dirty, supabase, a.branch, a.path
         );
     }
 

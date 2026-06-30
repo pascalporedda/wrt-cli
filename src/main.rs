@@ -8,6 +8,7 @@ mod cmd;
 mod codex;
 mod completions;
 mod db;
+mod envx;
 mod gitx;
 mod pm;
 mod state;
@@ -16,10 +17,10 @@ mod ui;
 mod util;
 mod worktree;
 
-use cli::{Cli, Cmd, USAGE_TEXT};
+use cli::{Cli, Cmd, RootAction, USAGE_TEXT};
 use cmd::{
     cmd_db, cmd_env, cmd_housekeeping, cmd_init, cmd_ls, cmd_new, cmd_path, cmd_prune, cmd_rm,
-    cmd_run, raw_run_has_sep, NewOpts,
+    cmd_root_init, cmd_root_status, cmd_run, raw_run_has_sep, NewOpts, RootInitOpts,
 };
 
 fn main() -> ExitCode {
@@ -55,6 +56,27 @@ fn run() -> Result<i32> {
             log.errorf("unsupported shell (only zsh is available)");
             return Ok(2);
         }
+        Cmd::Root {
+            action:
+                RootAction::Init {
+                    source,
+                    root,
+                    main,
+                    install,
+                    supabase,
+                    db,
+                },
+        } => {
+            let opts = RootInitOpts {
+                source: &source,
+                root: &root,
+                main: main.as_deref(),
+                install_mode: &install,
+                sb_mode: &supabase,
+                db_mode: &db,
+            };
+            return cmd_root_init(&log, opts);
+        }
         other => other,
     };
 
@@ -87,7 +109,15 @@ fn run() -> Result<i32> {
             force,
             print,
             model,
-        } => cmd_init(&log, &repo.root, force, print, model),
+        } => cmd_init(&log, &repo.config_root, force, print, model),
+
+        Cmd::Root {
+            action: RootAction::Status,
+        } => cmd_root_status(&log, &repo, &st),
+
+        Cmd::Root {
+            action: RootAction::Init { .. },
+        } => Ok(0),
 
         Cmd::New {
             name,
@@ -127,7 +157,7 @@ fn run() -> Result<i32> {
 
         Cmd::Path { name } => cmd_path(&log, &st, &name),
 
-        Cmd::Env { name } => cmd_env(&log, &st, name.as_deref()),
+        Cmd::Env { name } => cmd_env(&log, &repo, &st, name.as_deref()),
 
         Cmd::Rm {
             name,
@@ -144,7 +174,7 @@ fn run() -> Result<i32> {
                 log.errorf("usage: wrt run <name> -- <command> [args...]");
                 return Ok(2);
             }
-            cmd_run(&log, &st, &name, &command)
+            cmd_run(&log, &repo, &st, &name, &command)
         }
         Cmd::Completions { .. } => Ok(0),
     }

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::path::Path;
 
+use crate::gitx;
 use crate::state::State;
 use crate::ui;
 use crate::util::run_argv_with_wrt_env;
@@ -19,7 +20,13 @@ pub fn raw_run_has_sep(raw_args: &[String]) -> bool {
     }
 }
 
-pub fn cmd_run(log: &ui::Logger, st: &State, name: &str, command: &[String]) -> Result<i32> {
+pub fn cmd_run(
+    log: &ui::Logger,
+    repo: &gitx::Repo,
+    st: &State,
+    name: &str,
+    command: &[String],
+) -> Result<i32> {
     if command.is_empty() {
         log.errorf("usage: wrt run <name> -- <command> [args...]");
         return Ok(2);
@@ -38,7 +45,7 @@ pub fn cmd_run(log: &ui::Logger, st: &State, name: &str, command: &[String]) -> 
         a.path
     ));
 
-    match run_argv_with_wrt_env(Path::new(&a.path), a, command) {
+    match run_argv_with_wrt_env(repo, Path::new(&a.path), a, command) {
         Ok(code) => Ok(code),
         Err(e) => {
             log.errorf(&format!("run failed: {e}"));

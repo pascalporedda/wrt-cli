@@ -8,14 +8,21 @@ pub fn has_supabase_seed_or_migrations(root: &Path) -> bool {
 }
 
 pub fn command(
-    repo_root: &Path,
+    config_root: &Path,
     wt_path: &Path,
     op: &str,
 ) -> (Option<String>, Option<Vec<String>>) {
     let mut kind = None;
     let mut cmd = None;
 
-    let cfg_path = repo_root.join(".wrt.json");
+    let local_cfg = wt_path.join(".wrt.json");
+    let fallback_cfg = config_root.join(".wrt.json");
+    let cfg_path = if local_cfg.exists() {
+        local_cfg
+    } else {
+        fallback_cfg
+    };
+
     if cfg_path.exists() {
         if let Ok(s) = fs::read_to_string(&cfg_path) {
             if let Ok(d) = serde_json::from_str::<codex::Discovery>(&s) {

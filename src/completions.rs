@@ -19,6 +19,7 @@ _wrt() {
       _values 'command' \
         'help[Print usage]' \
         'init[Generate repo-local config]' \
+        'root[Manage bare-root environments]' \
         'new[Create a new worktree]' \
         'db[Run database utilities]' \
         'ls[List tracked worktrees]' \
@@ -77,6 +78,29 @@ _wrt() {
             '--print[Print config and exit]' \
             '--model=[Codex model]:model:'
           return
+          ;;
+        root)
+          case $words[3] in
+            init)
+              _arguments -C \
+                '1:source:_files' \
+                '--root=[Managed root directory]:directory:_files -/' \
+                '--main=[Main branch]:branch:' \
+                '--install=[Install deps]:mode:(auto true false)' \
+                '--supabase=[Supabase]:mode:(auto true false)' \
+                '--db=[DB setup]:mode:(auto true false)'
+              return
+              ;;
+            status)
+              return
+              ;;
+            *)
+              _values 'root command' \
+                'init[Create a managed root]' \
+                'status[Print managed-root status]'
+              return
+              ;;
+          esac
           ;;
         housekeeping)
           _arguments '--apply[Delete candidates]'

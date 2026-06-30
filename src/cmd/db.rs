@@ -44,7 +44,7 @@ pub fn cmd_db(
         DbAction::Seed { print } => ("seed", false, print),
         DbAction::Migrate { print } => ("migrate", false, print),
     };
-    let (kind_hint, cmd) = db::command(&repo.root, &wt_path, op);
+    let (kind_hint, cmd) = db::command(&repo.config_root, &wt_path, op);
 
     let Some(argv) = cmd else {
         let label = kind_hint.as_deref().unwrap_or("database");
@@ -82,5 +82,5 @@ pub fn cmd_db(
     }
 
     log.infof(&format!("{label}: running: {cmd_str}"));
-    run_argv_with_wrt_env(&wt_path, a, &argv)
+    run_argv_with_wrt_env(repo, &wt_path, a, &argv)
 }

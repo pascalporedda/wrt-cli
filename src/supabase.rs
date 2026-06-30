@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use std::fs;
 use std::path::Path;
+use toml_edit::{value, DocumentMut, InlineTable, Item, Table, Value};
 
 pub fn has_config(repo_root: &Path) -> bool {
     repo_root.join("supabase").join("config.toml").exists()
@@ -14,49 +15,31 @@ pub fn has_config(repo_root: &Path) -> bool {
 pub fn patch_config(worktree_root: &Path, worktree_name: &str, offset: i32) -> Result<()> {
     let p = worktree_root.join("supabase").join("config.toml");
     let b = fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
+    let mut doc = b
+        .parse::<DocumentMut>()
+        .with_context(|| format!("parse {}", p.display()))?;
 
-    let mut lines: Vec<String> = b.split('\n').map(|s| s.to_string()).collect();
     let mut changed = false;
 
-    for line in &mut lines {
-        if let Some((prefix, base, tail)) = project_id_parts(line) {
-            let suffix = sanitize_suffix(worktree_name);
-
-            // Avoid double-suffixing if re-run.
-            let mut want = base.to_string();
-            if !suffix.is_empty() && !base.ends_with(&format!("-{suffix}")) {
-                want = format!("{base}-{suffix}");
-            }
-
-            if want != base {
-                *line = format!("{prefix}\"{want}\"{tail}");
-                changed = true;
-            }
-            continue;
+    if let Some(project_id) = doc.get("project_id").and_then(Item::as_str) {
+        let suffix = sanitize_suffix(worktree_name);
+        let mut want = project_id.to_string();
+        if !suffix.is_empty() && !project_id.ends_with(&format!("-{suffix}")) {
+            want = format!("{project_id}-{suffix}");
         }
-
-        if let Some(nline) = patch_port_line(line, offset)? {
-            if nline != *line {
-                *line = nline;
-                changed = true;
-            }
-            continue;
-        }
-
-        if line.contains("http://") || line.contains("https://") {
-            let nline = patch_local_url_ports(line, offset);
-            if nline != *line {
-                *line = nline;
-                changed = true;
-            }
+        if want != project_id {
+            doc["project_id"] = value(want);
+            changed = true;
         }
     }
+
+    changed |= patch_table(doc.as_table_mut(), offset)?;
 
     if !changed {
         return Ok(());
     }
 
-    let mut out = lines.join("\n");
+    let mut out = doc.to_string();
     if !out.ends_with('\n') {
         out.push('\n');
     }
@@ -65,86 +48,83 @@ pub fn patch_config(worktree_root: &Path, worktree_name: &str, offset: i32) -> R
     Ok(())
 }
 
-fn project_id_parts(line: &str) -> Option<(&str, &str, &str)> {
-    let trimmed = line.trim_start();
-    if !trimmed.starts_with("project_id") {
-        return None;
+fn patch_table(table: &mut Table, offset: i32) -> Result<bool> {
+    let mut changed = false;
+    for (key, item) in table.iter_mut() {
+        changed |= patch_item(Some(key.get()), item, offset)?;
     }
-
-    let key_start = line.len() - trimmed.len();
-    let after_key = key_start + "project_id".len();
-    let rest = &line[after_key..];
-    let eq_pos = rest.find('=')?;
-    if !rest[..eq_pos].trim().is_empty() {
-        return None;
-    }
-
-    let value_start = after_key + eq_pos + 1;
-    let after_eq = &line[value_start..];
-    let quote_offset = after_eq.find('"')?;
-    if !after_eq[..quote_offset].trim().is_empty() {
-        return None;
-    }
-
-    let open = value_start + quote_offset;
-    let close = line[open + 1..].find('"')? + open + 1;
-    let tail = &line[close + 1..];
-    if !tail.trim_start().starts_with('#') && !tail.trim().is_empty() {
-        return None;
-    }
-
-    Some((&line[..open], &line[open + 1..close], tail))
+    Ok(changed)
 }
 
-fn patch_port_line(line: &str, offset: i32) -> Result<Option<String>> {
-    let trimmed = line.trim_start();
-    let Some(key) = ["port", "shadow_port", "smtp_port", "pop3_port"]
-        .iter()
-        .find(|key| trimmed.starts_with(**key))
-    else {
-        return Ok(None);
-    };
+fn patch_item(key: Option<&str>, item: &mut Item, offset: i32) -> Result<bool> {
+    match item {
+        Item::None => Ok(false),
+        Item::Value(v) => patch_value(key, v, offset),
+        Item::Table(t) => patch_table(t, offset),
+        Item::ArrayOfTables(tables) => {
+            let mut changed = false;
+            for table in tables.iter_mut() {
+                changed |= patch_table(table, offset)?;
+            }
+            Ok(changed)
+        }
+    }
+}
 
-    let key_start = line.len() - trimmed.len();
-    let after_key = key_start + key.len();
-    let rest = &line[after_key..];
-    let eq_pos = match rest.find('=') {
-        Some(pos) if rest[..pos].trim().is_empty() => pos,
-        _ => return Ok(None),
-    };
-
-    let value_start = after_key + eq_pos + 1;
-    let after_eq = &line[value_start..];
-    let digit_offset = after_eq.find(|ch: char| ch.is_ascii_digit());
-    let Some(digit_offset) = digit_offset else {
-        return Ok(None);
-    };
-    if !after_eq[..digit_offset].trim().is_empty() {
-        return Ok(None);
+fn patch_value(key: Option<&str>, value: &mut Value, offset: i32) -> Result<bool> {
+    if key.map(is_port_key).unwrap_or(false) {
+        if let Some(n) = value.as_integer() {
+            if n == 0 {
+                return Ok(false);
+            }
+            let n2 = n + i64::from(offset);
+            if !(1..=65535).contains(&n2) {
+                return Err(anyhow!("port out of range after offset: {n} -> {n2}"));
+            }
+            if n2 != n {
+                replace_value_preserving_decor(value, Value::from(n2));
+                return Ok(true);
+            }
+        }
     }
 
-    let digits_start = value_start + digit_offset;
-    let digits_len = line[digits_start..]
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .map(char::len_utf8)
-        .sum::<usize>();
-    let digits_end = digits_start + digits_len;
-    let tail = &line[digits_end..];
-    if !tail.trim_start().starts_with('#') && !tail.trim().is_empty() {
-        return Ok(None);
+    if let Some(s) = value.as_str() {
+        let nline = patch_local_url_ports(s, offset);
+        if nline != s {
+            replace_value_preserving_decor(value, Value::from(nline));
+            return Ok(true);
+        }
+        return Ok(false);
     }
 
-    let n: i32 = line[digits_start..digits_end].parse().unwrap_or(0);
-    if n == 0 {
-        return Ok(Some(line.to_string()));
+    match value {
+        Value::Array(array) => {
+            let mut changed = false;
+            for value in array.iter_mut() {
+                changed |= patch_value(None, value, offset)?;
+            }
+            Ok(changed)
+        }
+        Value::InlineTable(table) => patch_inline_table(table, offset),
+        _ => Ok(false),
     }
+}
 
-    let n2 = n + offset;
-    if !(1..=65535).contains(&n2) {
-        return Err(anyhow!("port out of range after offset: {n} -> {n2}"));
+fn patch_inline_table(table: &mut InlineTable, offset: i32) -> Result<bool> {
+    let mut changed = false;
+    for (key, value) in table.iter_mut() {
+        changed |= patch_value(Some(key.get()), value, offset)?;
     }
-    Ok(Some(format!("{}{}{}", &line[..digits_start], n2, tail)))
+    Ok(changed)
+}
+
+fn replace_value_preserving_decor(value: &mut Value, mut next: Value) {
+    *next.decor_mut() = value.decor().clone();
+    *value = next;
+}
+
+fn is_port_key(key: &str) -> bool {
+    matches!(key, "port" | "shadow_port" | "smtp_port" | "pop3_port")
 }
 
 fn patch_local_url_ports(line: &str, offset: i32) -> String {
@@ -368,6 +348,51 @@ pop3_port = 1100
             out.contains("pop3_port = 1200"),
             "pop3_port not offset: {out}"
         );
+    }
+
+    #[test]
+    fn patch_config_handles_nested_supabase_sections_and_url_arrays() {
+        let td = TempDir::new().unwrap();
+        let sbdir = td.path().join("supabase");
+        fs::create_dir_all(&sbdir).unwrap();
+        let p = sbdir.join("config.toml");
+        fs::write(
+            &p,
+            r#"project_id = "myproj"
+
+[api]
+port = 54321
+
+[db]
+port = 54322
+shadow_port = 54320
+
+[studio]
+port = 54323
+
+[inbucket]
+port = 54324
+smtp_port = 54325
+pop3_port = 54326
+
+[auth]
+site_url = "http://localhost:3000"
+additional_redirect_urls = ["http://localhost:3001/callback", "https://127.0.0.1:3002/auth"]
+"#,
+        )
+        .unwrap();
+
+        patch_config(td.path(), "feature/test", 100).unwrap();
+        let out = fs::read_to_string(&p).unwrap();
+        assert!(out.contains("project_id = \"myproj-feature-test\""));
+        assert!(out.contains("port = 54421"));
+        assert!(out.contains("port = 54422"));
+        assert!(out.contains("shadow_port = 54420"));
+        assert!(out.contains("smtp_port = 54425"));
+        assert!(out.contains("pop3_port = 54426"));
+        assert!(out.contains("http://localhost:3100"));
+        assert!(out.contains("http://localhost:3101/callback"));
+        assert!(out.contains("https://127.0.0.1:3102/auth"));
     }
 
     #[test]

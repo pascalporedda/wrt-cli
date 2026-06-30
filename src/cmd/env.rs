@@ -1,8 +1,10 @@
 use anyhow::Result;
 
+use crate::envx;
+use crate::gitx;
 use crate::state::State;
 use crate::ui;
-use crate::util::{infer_worktree_from_cwd, sh_quote};
+use crate::util::infer_worktree_from_cwd;
 use crate::worktree;
 
 pub fn cmd_path(log: &ui::Logger, st: &State, name: &str) -> Result<i32> {
@@ -15,7 +17,7 @@ pub fn cmd_path(log: &ui::Logger, st: &State, name: &str) -> Result<i32> {
     Ok(0)
 }
 
-pub fn cmd_env(log: &ui::Logger, st: &State, name: Option<&str>) -> Result<i32> {
+pub fn cmd_env(log: &ui::Logger, repo: &gitx::Repo, st: &State, name: Option<&str>) -> Result<i32> {
     let mut name = name.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
 
     if name.is_none() {
@@ -33,9 +35,6 @@ pub fn cmd_env(log: &ui::Logger, st: &State, name: Option<&str>) -> Result<i32> 
         return Ok(2);
     };
 
-    println!("export WRT_NAME={}", sh_quote(&a.name));
-    println!("export WRT_BRANCH={}", sh_quote(&a.branch));
-    println!("export WRT_PORT_BLOCK={}", a.block);
-    println!("export WRT_PORT_OFFSET={}", a.offset);
+    envx::print_exports(repo, a);
     Ok(0)
 }

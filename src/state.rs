@@ -6,14 +6,33 @@ use std::path::{Path, PathBuf};
 
 const STATE_DIR_NAME: &str = ".wrt";
 const STATE_FILE_NAME: &str = "state.json";
-const CURRENT_VER: i32 = 1;
+const CURRENT_VER: i32 = 2;
+
+pub const LAYOUT_MANAGED_ROOT: &str = "managed-root";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct State {
     #[serde(default)]
     pub version: i32,
     #[serde(default)]
+    pub root: Option<RootState>,
+    #[serde(default)]
     pub allocations: BTreeMap<String, Allocation>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RootState {
+    pub layout: String,
+    #[serde(rename = "managedRoot")]
+    pub managed_root: String,
+    #[serde(rename = "gitCommonDir")]
+    pub git_common_dir: String,
+    #[serde(rename = "mainWorktree")]
+    pub main_worktree: String,
+    #[serde(rename = "worktreesPath")]
+    pub worktrees_path: String,
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -23,28 +42,38 @@ pub struct Allocation {
     pub path: String,
     pub block: i32,
     pub offset: i32,
+    #[serde(default = "default_status")]
+    pub status: String,
     #[serde(rename = "createdAt")]
     pub created_at: String,
 }
 
 impl State {
+    pub fn empty() -> State {
+        State {
+            version: CURRENT_VER,
+            root: None,
+            allocations: BTreeMap::new(),
+        }
+    }
+
     pub fn load(git_common_dir: &Path) -> Result<State> {
         let p = file_path(git_common_dir);
         let b = match fs::read(&p) {
             Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(State {
-                    version: CURRENT_VER,
-                    allocations: BTreeMap::new(),
-                })
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(State::empty()),
             Err(e) => return Err(e).with_context(|| format!("read {}", p.display())),
         };
 
         let mut st: State =
             serde_json::from_slice(&b).with_context(|| format!("parse {}", p.display()))?;
-        if st.version == 0 {
+        if st.version < CURRENT_VER {
             st.version = CURRENT_VER;
+        }
+        for a in st.allocations.values_mut() {
+            if a.status.trim().is_empty() {
+                a.status = default_status();
+            }
         }
         Ok(st)
     }
@@ -82,16 +111,17 @@ fn file_path(git_common_dir: &Path) -> PathBuf {
     git_common_dir.join(STATE_DIR_NAME).join(STATE_FILE_NAME)
 }
 
+fn default_status() -> String {
+    "active".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn allocate_block_skips_0_and_reuses_holes() {
-        let mut st = State {
-            version: CURRENT_VER,
-            allocations: BTreeMap::new(),
-        };
+        let mut st = State { ..State::empty() };
         st.allocations.insert(
             "a".to_string(),
             Allocation {
@@ -100,6 +130,7 @@ mod tests {
                 path: "/tmp/a".to_string(),
                 block: 1,
                 offset: 100,
+                status: "active".to_string(),
                 created_at: "x".to_string(),
             },
         );
@@ -111,10 +142,31 @@ mod tests {
                 path: "/tmp/b".to_string(),
                 block: 3,
                 offset: 300,
+                status: "active".to_string(),
                 created_at: "x".to_string(),
             },
         );
 
         assert_eq!(st.allocate_block().unwrap(), 2);
+    }
+
+    #[test]
+    fn load_migrates_v1_allocations() {
+        let td = tempfile::TempDir::new().unwrap();
+        let state_dir = td.path().join(".wrt");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(
+            state_dir.join("state.json"),
+            r#"{"version":1,"allocations":{"x":{"name":"x","branch":"x","path":"/tmp/x","block":1,"offset":100,"createdAt":"now"}}}"#,
+        )
+        .unwrap();
+
+        let st = State::load(td.path()).unwrap();
+        assert_eq!(st.version, CURRENT_VER);
+        assert_eq!(
+            st.allocations.get("x").unwrap().status,
+            "active",
+            "v1 allocations should default to active"
+        );
     }
 }

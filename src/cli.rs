@@ -4,6 +4,8 @@ pub const USAGE_TEXT: &str = r#"wrt: git worktree helper geared for parallel (ag
 
 Usage:
   wrt init [--force] [--print] [--model <codex-model>]
+  wrt root init <source> --root <dir> [--main <branch>] [--install auto|true|false] [--supabase auto|true|false] [--db auto|true|false]
+  wrt root status
   wrt new <name> [--from <ref>] [--branch <branch>] [--install auto|true|false] [--supabase auto|true|false] [--db auto|true|false] [--cd]
   wrt db [<name>] reset|seed|migrate [--print]
   wrt ls
@@ -17,6 +19,7 @@ Usage:
 
 Conventions:
   - Worktrees live under: <repo>/.worktrees/<name>
+  - Managed roots live under: <root>/.git + <root>/main + <root>/<feature>
   - Each worktree gets a reserved "port block" (offset = block*100); block 0 is kept for the main workdir.
   - If a Supabase config exists (supabase/config.toml), wrt can patch it to avoid port/container collisions.
   - If DB reset/seed commands are discovered (via .wrt.json), wrt can optionally run them after setup.
@@ -44,6 +47,12 @@ pub enum Cmd {
         print: bool,
         #[arg(long)]
         model: Option<String>,
+    },
+
+    /// Manage bare-root wrt environments
+    Root {
+        #[command(subcommand)]
+        action: RootAction,
     },
 
     /// Create a new worktree (+branch), optionally install deps and start supabase
@@ -141,4 +150,24 @@ pub enum DbAction {
         #[arg(long)]
         print: bool,
     },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum RootAction {
+    /// Create a managed root with a bare common repo and main worktree
+    Init {
+        source: String,
+        #[arg(long)]
+        root: String,
+        #[arg(long)]
+        main: Option<String>,
+        #[arg(long, default_value = "auto")]
+        install: String,
+        #[arg(long, default_value = "auto")]
+        supabase: String,
+        #[arg(long, default_value = "auto")]
+        db: String,
+    },
+    /// Print managed-root status
+    Status,
 }

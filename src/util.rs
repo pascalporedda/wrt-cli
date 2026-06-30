@@ -3,6 +3,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::gitx::Repo;
 use crate::state::{Allocation, State};
 
 pub fn run_cmd(dir: &Path, cmd: &str, args: &[&str]) -> Result<()> {
@@ -20,15 +21,16 @@ pub fn run_cmd(dir: &Path, cmd: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-pub fn run_argv_with_wrt_env(dir: &Path, a: &Allocation, argv: &[String]) -> Result<i32> {
+pub fn run_argv_with_wrt_env(
+    repo: &Repo,
+    dir: &Path,
+    a: &Allocation,
+    argv: &[String],
+) -> Result<i32> {
     let cmd = &argv[0];
     let cmd_args = &argv[1..];
 
-    let mut envs: Vec<(String, String)> = env::vars().collect();
-    envs.push(("WRT_NAME".into(), a.name.clone()));
-    envs.push(("WRT_BRANCH".into(), a.branch.clone()));
-    envs.push(("WRT_PORT_BLOCK".into(), a.block.to_string()));
-    envs.push(("WRT_PORT_OFFSET".into(), a.offset.to_string()));
+    let envs: Vec<(String, String)> = env::vars().collect();
 
     let mut c = Command::new(cmd);
     c.args(cmd_args)
@@ -41,6 +43,7 @@ pub fn run_argv_with_wrt_env(dir: &Path, a: &Allocation, argv: &[String]) -> Res
     for (k, v) in envs {
         c.env(k, v);
     }
+    crate::envx::apply_to_command_env(&mut c, repo, a);
 
     let status = c.status().with_context(|| format!("run {cmd}"))?;
     if !status.success() {
@@ -87,8 +90,10 @@ pub fn confirm(prompt: &str) -> Result<bool> {
 
 pub fn infer_worktree_from_cwd(st: &State) -> Option<String> {
     let wd = env::current_dir().ok()?;
+    let wd = wd.canonicalize().unwrap_or(wd);
     for a in st.allocations.values() {
         let ap = PathBuf::from(&a.path);
+        let ap = ap.canonicalize().unwrap_or(ap);
         if wd.strip_prefix(&ap).is_ok() {
             return Some(a.name.clone());
         }

@@ -52,6 +52,17 @@ fn set_minimal_path(cmd: &mut assert_cmd::Command) {
     cmd.env("PATH", "/usr/bin:/bin");
 }
 
+#[cfg(unix)]
+fn write_mock_bin(dir: &Path, name: &str, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = dir.join(name);
+    fs::write(&path, body).unwrap();
+    let mut perms = fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).unwrap();
+}
+
 #[test]
 fn help_works_outside_git_repo() {
     let td = TempDir::new().unwrap();
@@ -189,6 +200,183 @@ fn new_patches_supabase_and_sets_skip_worktree_when_auto() {
     // Ensure skip-worktree is set.
     let v = git_out(&wt_dir, &["ls-files", "-v", "supabase/config.toml"]);
     assert!(v.starts_with('S'));
+}
+
+#[test]
+fn root_init_status_and_new_use_sibling_worktrees() {
+    let source = init_repo();
+    fs::write(
+        source.path().join(".wrt.json"),
+        r#"{
+  "version": 1,
+  "port_block_size": 100,
+  "package_manager": { "name": "unknown", "install_command": ["npm","install"], "notes": null },
+  "services": [{ "name": "web", "kind": "web", "dev_command": ["npm","run","dev"], "base_port": 3000, "port_env": "PORT", "url_env": "APP_URL", "notes": null }],
+  "database": { "detected": false, "kind": null, "migrate_command": null, "seed_command": null, "reset_command": null, "notes": null },
+  "supabase": { "detected": false, "config_path": null, "start_command": null, "base_ports": null, "notes": null },
+  "notes": null
+}
+"#,
+    )
+    .unwrap();
+    fs::write(source.path().join(".env"), "FOO=bar\n").unwrap();
+    let managed = TempDir::new().unwrap();
+
+    let mut cmd = wrt_cmd();
+    cmd.current_dir(source.path()).args([
+        "root",
+        "init",
+        source.path().to_str().unwrap(),
+        "--root",
+        managed.path().to_str().unwrap(),
+        "--install",
+        "false",
+        "--supabase",
+        "false",
+        "--db",
+        "false",
+    ]);
+    set_minimal_path(&mut cmd);
+    cmd.assert().success();
+
+    let main = managed.path().join("main");
+    assert!(managed.path().join(".git").is_dir());
+    assert!(main.join("README.md").exists());
+    assert!(main.join(".wrt.env").exists());
+    assert_eq!(fs::read_to_string(main.join(".env")).unwrap(), "FOO=bar\n");
+
+    wrt_cmd()
+        .current_dir(managed.path())
+        .args(["root", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("layout: managed-root"))
+        .stdout(predicate::str::contains("tracked worktrees: 1"));
+
+    wrt_cmd()
+        .current_dir(&main)
+        .args(["root", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("invocation worktree:"));
+
+    let mut cmd = wrt_cmd();
+    cmd.current_dir(managed.path()).args([
+        "new",
+        "feature/demo",
+        "--install",
+        "false",
+        "--supabase",
+        "false",
+        "--db",
+        "false",
+    ]);
+    set_minimal_path(&mut cmd);
+    cmd.assert().success();
+
+    let feature = managed.path().join("feature-demo");
+    assert!(feature.exists());
+    assert!(!main.join(".worktrees").join("feature-demo").exists());
+    assert_eq!(
+        fs::read_to_string(feature.join(".env")).unwrap(),
+        "FOO=bar\n"
+    );
+    assert!(feature.join(".wrt.json").exists());
+
+    wrt_cmd()
+        .current_dir(&feature)
+        .args(["env"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("export WRT_NAME='feature-demo'"))
+        .stdout(predicate::str::contains(format!(
+            "export WRT_ROOT='{}'",
+            managed.path().display()
+        )))
+        .stdout(predicate::str::contains(format!(
+            "export WRT_MAIN_PATH='{}'",
+            main.display()
+        )))
+        .stdout(predicate::str::contains("export PORT='3100'"))
+        .stdout(predicate::str::contains(
+            "export APP_URL='http://localhost:3100'",
+        ));
+}
+
+#[cfg(unix)]
+#[test]
+fn new_runs_mocked_package_install_and_supabase_lifecycle() {
+    let td = init_repo();
+    fs::write(
+        td.path().join("package.json"),
+        r#"{"scripts":{"dev":"echo dev"}}"#,
+    )
+    .unwrap();
+    fs::write(td.path().join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+    let sbdir = td.path().join("supabase");
+    fs::create_dir_all(&sbdir).unwrap();
+    fs::write(
+        sbdir.join("config.toml"),
+        "project_id = \"myproj\"\nport = 5432\n",
+    )
+    .unwrap();
+    git(td.path(), &["add", "."]);
+    git(
+        td.path(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-m",
+            "add setup files",
+        ],
+    );
+
+    let bin = TempDir::new().unwrap();
+    let log = td.path().join("mock.log");
+    write_mock_bin(
+        bin.path(),
+        "pnpm",
+        "#!/bin/sh\nprintf 'pnpm %s\\n' \"$*\" >> \"$MOCK_LOG\"\n",
+    );
+    write_mock_bin(
+        bin.path(),
+        "supabase",
+        "#!/bin/sh\nprintf 'supabase %s\\n' \"$*\" >> \"$MOCK_LOG\"\n",
+    );
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+
+    wrt_cmd()
+        .current_dir(td.path())
+        .env("PATH", &path)
+        .env("MOCK_LOG", &log)
+        .args([
+            "new",
+            "x",
+            "--install",
+            "true",
+            "--supabase",
+            "true",
+            "--db",
+            "false",
+        ])
+        .assert()
+        .success();
+
+    wrt_cmd()
+        .current_dir(td.path())
+        .env("PATH", &path)
+        .env("MOCK_LOG", &log)
+        .args(["rm", "x", "--force"])
+        .assert()
+        .success();
+
+    let log = fs::read_to_string(log).unwrap();
+    assert!(log.contains("pnpm install"), "{log}");
+    assert!(log.contains("supabase start"), "{log}");
+    assert!(log.contains("supabase stop"), "{log}");
 }
 
 #[test]
