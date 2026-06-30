@@ -37,8 +37,8 @@ The pain is always the same:
 
 | | |
 |---|---|
-| **Worktree orchestration** | Creates worktrees under `<repo>/.worktrees/<name>` or as siblings in a managed root |
-| **Managed roots** | Can bootstrap `<root>/.git` as a bare common repo with `<root>/main` and `<root>/<feature>` checkouts |
+| **Worktree orchestration** | Creates feature worktrees as siblings of `main` inside a managed root |
+| **Managed roots** | Can clone/bootstrap `<root>/.git` as a bare common repo with `<root>/main` and `<root>/<feature>` checkouts |
 | **Port block reservation** | Allocates a unique `WRT_PORT_BLOCK` per worktree (offset = `block * 100`) |
 | **Shell-friendly env** | Writes `.wrt.env` into each worktree and can print `export ...` lines for your shell |
 | **Supabase isolation** | Patches `supabase/config.toml` (project_id suffix + port offsets + localhost URLs) and sets `skip-worktree` |
@@ -54,8 +54,15 @@ The pain is always the same:
 # install locally
 cargo install --path .
 
-# in any git repo
-wrt init            # optional: generates .wrt.json via Codex (see below)
+# clone into a managed root
+wrt clone git@github.com:org/app.git --install false --supabase false
+cd app
+
+# optional: generates .wrt.json via Codex in main
+cd main
+wrt init
+cd ..
+
 wrt new a/gpt/login-timeout
 
 # jump into it
@@ -69,8 +76,8 @@ echo "$WRT_PORT_OFFSET"
 Managed-root layout:
 
 ```bash
-wrt root init git@github.com:org/app.git --root ~/work/app --install false --supabase false
-cd ~/work/app
+wrt clone git@github.com:org/app.git --install false --supabase false
+cd app
 wrt new a/gpt/login-timeout
 cd "$(wrt path a-gpt-login-timeout)"
 ```
@@ -119,14 +126,17 @@ wrt run a-gpt-login-timeout -- sh -lc 'echo $WRT_NAME && env | rg ^WRT_'
 
 ```text
 wrt init [--force] [--print] [--model <codex-model>]
+wrt clone <git-repo-url> [--root <dir>] [--main <branch>] [--install auto|true|false] [--supabase auto|true|false] [--db auto|true|false]
 wrt root init <source> --root <dir> [--main <branch>] [--install auto|true|false] [--supabase auto|true|false] [--db auto|true|false]
 wrt root status
 wrt new <name> [--from <ref>] [--branch <branch>] [--install auto|true|false] [--supabase auto|true|false] [--db auto|true|false] [--cd]
+wrt add <name> [--from <ref>] [--branch <branch>] [--install auto|true|false] [--supabase auto|true|false] [--db auto|true|false] [--cd]
 wrt db [<name>] reset|seed|migrate [--print]
 wrt ls
 wrt path <name>
 wrt env [<name>]
 wrt rm <name> [--force] [--delete-branch]
+wrt remove <name> [--force] [--delete-branch]
 wrt prune
 wrt housekeeping [--apply]
 wrt run <name> -- <command> [args...]
@@ -138,8 +148,14 @@ Examples:
 ```bash
 # create from a ref (default is HEAD)
 wrt new perf/agent-01 --from origin/main
+wrt add perf/agent-02 --from origin/main
 
 # create a managed root with sibling worktrees
+wrt clone git@github.com:org/app.git --install false --supabase false
+cd app
+wrt new perf/agent-01
+
+# create a managed root from an existing local checkout
 wrt root init . --root ../my-repo-wrt --install false --supabase false
 cd ../my-repo-wrt
 wrt root status
@@ -156,6 +172,7 @@ wrt new x --install false --supabase false
 
 # remove worktree (and optionally the branch ref)
 wrt rm x --force
+wrt remove x --force
 wrt rm x --force --delete-branch
 
 # prune stale state entries after manual deletions
@@ -170,8 +187,8 @@ wrt housekeeping
 ## How It Works
 
 - **Worktree paths**
-  - Legacy mode: `wrt new <name>` slugs the directory name (example: `a/gpt/fix-login-timeout` -> `.worktrees/a-gpt-fix-login-timeout`)
-  - Managed-root mode: `wrt new <name>` creates the slug as a sibling of `main` (example: `<root>/a-gpt-fix-login-timeout`)
+  - `wrt new <name>` creates the slug as a sibling of `main` (example: `<root>/a-gpt-fix-login-timeout`)
+  - `wrt clone <source>` derives `<root>` from the repo URL, then creates `<root>/.git` and `<root>/main`
   - `wrt root init <source> --root <dir>` creates `<dir>/.git` as the bare common repo and `<dir>/main` as block `0`
   - branch names keep slashes, but spaces are normalized to `-`
 - **State**
@@ -182,7 +199,6 @@ wrt housekeeping
   - generated vars include `WRT_ROOT`, `WRT_WORKTREE_PATH`, `WRT_MAIN_PATH`, `COMPOSE_PROJECT_NAME`, and discovered service port/url vars from `.wrt.json`
 - **Git excludes**
   - `wrt` appends these to `.git/info/exclude` to reduce accidental commits:
-    - `.worktrees/`
     - `.wrt.env`
     - `.wrt.json`
 
@@ -203,10 +219,11 @@ If `supabase/config.toml` exists inside the worktree, `wrt` can patch it for iso
 
 ## Known Issues / Gotchas
 
+- `wrt` commands operate only inside managed roots created by `wrt clone` or `wrt root init`
 - `wrt run` must be invoked with `--` exactly like `wrt run <name> -- <command> ...` (otherwise it exits with code `2`)
 - `wrt env` with no `<name>` only works when you run it from inside a tracked worktree (it infers from `cwd`)
 - `wrt new --supabase auto` patches config if it sees `supabase/config.toml`, but it only runs `supabase start` if the Supabase CLI exists in `PATH`
-- `wrt root init` clones committed Git state. It copies `.env` and `.wrt.json` only when the source is a local directory and those files exist.
+- `wrt clone` / `wrt root init` clone committed Git state. They copy `.env` and `.wrt.json` only when the source is a local directory and those files exist.
 - Worktree name slugging is intentionally strict. If your `<name>` turns into an empty slug, it becomes `wrt`
 
 ---
