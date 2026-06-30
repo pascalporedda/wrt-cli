@@ -42,7 +42,6 @@ pub struct Allocation {
     pub path: String,
     pub block: i32,
     pub offset: i32,
-    #[serde(default = "default_status")]
     pub status: String,
     #[serde(rename = "createdAt")]
     pub created_at: String,
@@ -65,15 +64,13 @@ impl State {
             Err(e) => return Err(e).with_context(|| format!("read {}", p.display())),
         };
 
-        let mut st: State =
+        let st: State =
             serde_json::from_slice(&b).with_context(|| format!("parse {}", p.display()))?;
-        if st.version < CURRENT_VER {
-            st.version = CURRENT_VER;
-        }
-        for a in st.allocations.values_mut() {
-            if a.status.trim().is_empty() {
-                a.status = default_status();
-            }
+        if st.version != CURRENT_VER {
+            return Err(anyhow!(
+                "unsupported wrt state version {}; expected {CURRENT_VER}",
+                st.version
+            ));
         }
         Ok(st)
     }
@@ -109,10 +106,6 @@ impl State {
 
 fn file_path(git_common_dir: &Path) -> PathBuf {
     git_common_dir.join(STATE_DIR_NAME).join(STATE_FILE_NAME)
-}
-
-fn default_status() -> String {
-    "active".to_string()
 }
 
 #[cfg(test)]
@@ -151,22 +144,17 @@ mod tests {
     }
 
     #[test]
-    fn load_migrates_v1_allocations() {
+    fn load_rejects_old_state_versions() {
         let td = tempfile::TempDir::new().unwrap();
         let state_dir = td.path().join(".wrt");
         fs::create_dir_all(&state_dir).unwrap();
         fs::write(
             state_dir.join("state.json"),
-            r#"{"version":1,"allocations":{"x":{"name":"x","branch":"x","path":"/tmp/x","block":1,"offset":100,"createdAt":"now"}}}"#,
+            r#"{"version":1,"allocations":{"x":{"name":"x","branch":"x","path":"/tmp/x","block":1,"offset":100,"status":"active","createdAt":"now"}}}"#,
         )
         .unwrap();
 
-        let st = State::load(td.path()).unwrap();
-        assert_eq!(st.version, CURRENT_VER);
-        assert_eq!(
-            st.allocations.get("x").unwrap().status,
-            "active",
-            "v1 allocations should default to active"
-        );
+        let err = State::load(td.path()).unwrap_err().to_string();
+        assert!(err.contains("unsupported wrt state version"), "{err}");
     }
 }
