@@ -23,11 +23,15 @@ fn git_out(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
-fn set_origin_with_remote_tracking(repo: &Path, origin: &Path) {
+fn set_origin(repo: &Path, origin: &Path) {
     git(
         repo,
         &["remote", "set-url", "origin", origin.to_str().unwrap()],
     );
+}
+
+fn set_origin_with_remote_tracking(repo: &Path, origin: &Path) {
+    set_origin(repo, origin);
     git(
         repo,
         &[
@@ -403,6 +407,10 @@ fn root_init_status_and_new_use_sibling_worktrees() {
     assert!(main.join("README.md").exists());
     assert!(main.join(".wrt.env").exists());
     assert_eq!(fs::read_to_string(main.join(".env")).unwrap(), "FOO=bar\n");
+    assert_eq!(
+        git_out(&main, &["config", "--get", "remote.origin.fetch"]).trim(),
+        "+refs/heads/*:refs/remotes/origin/*"
+    );
 
     wrt_cmd()
         .current_dir(managed.path())
@@ -754,8 +762,7 @@ fn new_uses_upstream_branch_when_present() {
     git(source.path(), &["branch", "-D", "feature/upstream"]);
     let (_source, td) = init_managed_from(source);
     let main_path = main_path(&td);
-    set_origin_with_remote_tracking(&main_path, origin.path());
-    git(&main_path, &["fetch", "origin"]);
+    set_origin(&main_path, origin.path());
 
     let mut cmd = wrt_cmd();
     cmd.current_dir(td.path()).args([
@@ -779,6 +786,92 @@ fn new_uses_upstream_branch_when_present() {
         &["rev-parse", "--abbrev-ref", "feature/upstream@{upstream}"],
     );
     assert_eq!(upstream.trim(), "origin/feature/upstream");
+}
+
+#[test]
+fn new_replaces_untracked_local_branch_with_remote_branch() {
+    let source = init_repo();
+    let origin = TempDir::new().unwrap();
+
+    git(origin.path(), &["init", "--bare"]);
+    git(
+        source.path(),
+        &["remote", "add", "origin", origin.path().to_str().unwrap()],
+    );
+
+    let main = git_out(source.path(), &["rev-parse", "--abbrev-ref", "HEAD"]);
+    let main = main.trim();
+    git(source.path(), &["push", "-u", "origin", main]);
+
+    git(source.path(), &["checkout", "-b", "feature/existing"]);
+    fs::write(source.path().join("FEATURE.txt"), "hello\n").unwrap();
+    git(source.path(), &["add", "FEATURE.txt"]);
+    git(
+        source.path(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-m",
+            "feature",
+        ],
+    );
+    git(source.path(), &["push", "-u", "origin", "feature/existing"]);
+
+    git(source.path(), &["checkout", main]);
+    git(source.path(), &["branch", "-D", "feature/existing"]);
+    git(source.path(), &["checkout", "-b", "feature/existing"]);
+    fs::write(source.path().join("STALE.txt"), "stale\n").unwrap();
+    git(source.path(), &["add", "STALE.txt"]);
+    git(
+        source.path(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-m",
+            "stale",
+        ],
+    );
+    git(source.path(), &["checkout", main]);
+    let (_source, td) = init_managed_from(source);
+    let main_path = main_path(&td);
+    set_origin_with_remote_tracking(&main_path, origin.path());
+    git(&main_path, &["fetch", "origin"]);
+
+    let mut cmd = wrt_cmd();
+    cmd.current_dir(td.path()).args([
+        "add",
+        "feature/existing",
+        "--install",
+        "false",
+        "--supabase",
+        "false",
+        "--db",
+        "false",
+    ]);
+    set_minimal_path(&mut cmd);
+    cmd.assert().success();
+
+    let upstream = git_out(
+        &main_path,
+        &["rev-parse", "--abbrev-ref", "feature/existing@{upstream}"],
+    );
+    assert_eq!(upstream.trim(), "origin/feature/existing");
+    assert!(worktree_path(&td, "feature-existing")
+        .join("FEATURE.txt")
+        .exists());
+    assert!(!worktree_path(&td, "feature-existing")
+        .join("STALE.txt")
+        .exists());
+    assert_eq!(
+        git_out(&main_path, &["rev-parse", "feature/existing"]),
+        git_out(&main_path, &["rev-parse", "origin/feature/existing"])
+    );
 }
 
 #[test]

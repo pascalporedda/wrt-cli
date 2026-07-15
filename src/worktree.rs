@@ -44,12 +44,37 @@ pub fn add(git_dir: &Path, wt_path: &Path, branch: &str, from_ref: &str) -> Resu
     let remotes = list_remotes(git_dir)?;
     let remote = pick_remote(&remotes);
 
-    if let Some(remote) = remote {
-        run_git(git_dir, ["fetch", "--prune", remote])
-            .with_context(|| format!("git fetch --prune {remote}"))?;
-    }
+    let remote_branch = if let Some(remote) = remote {
+        let remote_head = format!("refs/heads/{branch}");
+        let remote_ref = format!("refs/remotes/{remote}/{branch}");
+        let advertised = git_out(
+            git_dir,
+            ["ls-remote", "--heads", remote, remote_head.as_str()],
+        )?;
 
-    // Prefer existing local branch. If it doesn't exist, check for upstream.
+        if advertised.trim().is_empty() {
+            run_git(git_dir, ["fetch", "--prune", remote])
+                .with_context(|| format!("git fetch --prune {remote}"))?;
+            None
+        } else {
+            let fetch_key = format!("remote.{remote}.fetch");
+            if !git_ok(git_dir, ["config", "--get-all", fetch_key.as_str()])? {
+                let fetch_refspec = format!("+refs/heads/*:refs/remotes/{remote}/*");
+                run_git(
+                    git_dir,
+                    ["config", fetch_key.as_str(), fetch_refspec.as_str()],
+                )?;
+            }
+            let refspec = format!("+{remote_head}:{remote_ref}");
+            run_git(git_dir, ["fetch", remote, refspec.as_str()])
+                .with_context(|| format!("git fetch {remote} {remote_head}"))?;
+            Some(format!("{remote}/{branch}"))
+        }
+    } else {
+        None
+    };
+
+    // Prefer an existing local branch, but attach it to the matching remote branch.
     if git_ok(
         git_dir,
         [
@@ -59,6 +84,24 @@ pub fn add(git_dir: &Path, wt_path: &Path, branch: &str, from_ref: &str) -> Resu
             &format!("refs/heads/{branch}"),
         ],
     )? {
+        if let Some(upstream) = remote_branch.as_deref() {
+            let local_oid = git_out(git_dir, ["rev-parse", branch])?;
+            let upstream_oid = git_out(git_dir, ["rev-parse", upstream])?;
+            let upstream_ref = format!("{branch}@{{upstream}}");
+            let has_upstream = git_ok(
+                git_dir,
+                ["rev-parse", "--verify", "--quiet", upstream_ref.as_str()],
+            )?;
+            let can_fast_forward = local_oid != upstream_oid
+                && git_ok(git_dir, ["merge-base", "--is-ancestor", branch, upstream])?;
+            if !has_upstream || can_fast_forward {
+                run_git(
+                    git_dir,
+                    ["branch", "--force", "--no-track", branch, upstream],
+                )?;
+            }
+            run_git(git_dir, ["branch", "--set-upstream-to", upstream, branch])?;
+        }
         return run_git(
             git_dir,
             [
@@ -70,24 +113,17 @@ pub fn add(git_dir: &Path, wt_path: &Path, branch: &str, from_ref: &str) -> Resu
         );
     }
 
-    if let Some(remote) = remote {
-        let remote_ref = format!("refs/remotes/{remote}/{branch}");
-        if git_ok(
+    if let Some(start_point) = remote_branch {
+        run_git(git_dir, ["branch", "--track", branch, start_point.as_str()])?;
+        return run_git(
             git_dir,
-            ["show-ref", "--verify", "--quiet", remote_ref.as_str()],
-        )? {
-            let start_point = format!("{remote}/{branch}");
-            run_git(git_dir, ["branch", "--track", branch, start_point.as_str()])?;
-            return run_git(
-                git_dir,
-                [
-                    "worktree",
-                    "add",
-                    wt_path.to_string_lossy().as_ref(),
-                    branch,
-                ],
-            );
-        }
+            [
+                "worktree",
+                "add",
+                wt_path.to_string_lossy().as_ref(),
+                branch,
+            ],
+        );
     }
 
     run_git(

@@ -76,6 +76,22 @@ pub fn cmd_root_init(log: &ui::Logger, opts: RootInitOpts<'_>) -> Result<i32> {
         return Ok(1);
     }
 
+    let fetch_refspec = "+refs/heads/*:refs/remotes/origin/*";
+    if let Err(e) = run_cmd(
+        Path::new("."),
+        "git",
+        &[
+            "--git-dir",
+            &git_dir_arg,
+            "config",
+            "remote.origin.fetch",
+            fetch_refspec,
+        ],
+    ) {
+        log.errorf(&format!("configure origin tracking failed: {e}"));
+        return Ok(1);
+    }
+
     let branch = match opts.main.map(str::trim).filter(|s| !s.is_empty()) {
         Some(branch) => worktree::normalize_branch(branch),
         None => default_branch(&git_dir).unwrap_or_else(|| "main".to_string()),
