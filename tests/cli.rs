@@ -43,8 +43,12 @@ fn set_origin_with_remote_tracking(repo: &Path, origin: &Path) {
 }
 
 fn init_repo() -> TempDir {
+    init_repo_on_branch("main")
+}
+
+fn init_repo_on_branch(branch: &str) -> TempDir {
     let td = TempDir::new().unwrap();
-    git(td.path(), &["init"]);
+    git(td.path(), &["init", "-b", branch]);
     fs::write(td.path().join("README.md"), "x\n").unwrap();
     git(td.path(), &["add", "."]);
     git(
@@ -528,6 +532,46 @@ fn clone_derives_root_and_runs_managed_setup() {
         .assert()
         .success()
         .stdout(predicate::str::contains("layout: managed-root"))
+        .stdout(predicate::str::contains("tracked worktrees: 1"));
+}
+
+#[test]
+fn clone_names_primary_worktree_after_default_branch() {
+    let source = init_repo_on_branch("staging");
+
+    let parent = TempDir::new().unwrap();
+    let root_name = source.path().file_name().unwrap().to_string_lossy();
+    let managed = parent.path().join(root_name.as_ref());
+
+    let mut cmd = wrt_cmd();
+    cmd.current_dir(parent.path()).args([
+        "clone",
+        source.path().to_str().unwrap(),
+        "--install",
+        "false",
+        "--supabase",
+        "false",
+        "--db",
+        "false",
+    ]);
+    set_minimal_path(&mut cmd);
+    cmd.assert().success();
+
+    let staging = managed.join("staging");
+    assert!(managed.join(".git").is_dir());
+    assert!(staging.join("README.md").exists());
+    assert!(!managed.join("main").exists());
+    assert_eq!(
+        git_out(&staging, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+        "staging"
+    );
+
+    wrt_cmd()
+        .current_dir(&managed)
+        .args(["root", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_match(r"main worktree: .*/staging\n").unwrap())
         .stdout(predicate::str::contains("tracked worktrees: 1"));
 }
 

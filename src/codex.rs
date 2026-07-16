@@ -91,14 +91,26 @@ pub struct BasePorts {
     pub inbucket: Option<i32>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct DiscoverOpts {
     pub repo_root: PathBuf,
-    pub model: Option<String>,
+    pub model: String,
+}
+
+impl Default for DiscoverOpts {
+    fn default() -> Self {
+        Self {
+            repo_root: PathBuf::new(),
+            model: DEFAULT_MODEL.to_string(),
+        }
+    }
 }
 
 static SCHEMA_BYTES: &[u8] = include_bytes!("../assets/wrt-discovery.schema.json");
 static PROMPT_TEXT: &str = include_str!("../assets/discover.txt");
+
+pub const DEFAULT_MODEL: &str = "gpt-5.6-sol";
+const REASONING_EFFORT: &str = "medium";
 
 pub fn discover(opts: DiscoverOpts) -> Result<(Vec<u8>, Discovery)> {
     if let Ok(v) = std::env::var("WRT_CODEX_MOCK_OUTPUT") {
@@ -118,26 +130,17 @@ pub fn discover(opts: DiscoverOpts) -> Result<(Vec<u8>, Discovery)> {
     fs::write(&schema_path, SCHEMA_BYTES)
         .with_context(|| format!("write {}", schema_path.display()))?;
 
-    let mut args: Vec<String> = vec![
-        "exec".into(),
-        PROMPT_TEXT.to_string(),
-        "--output-schema".into(),
-        schema_path.to_string_lossy().to_string(),
-        "-o".into(),
-        out_path.to_string_lossy().to_string(),
-    ];
-    if let Some(m) = opts
-        .model
-        .as_ref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
-        args.push("--model".into());
-        args.push(m.to_string());
-    }
-
     let status = Command::new(codex)
-        .args(args)
+        .arg("exec")
+        .arg(PROMPT_TEXT)
+        .arg("--output-schema")
+        .arg(&schema_path)
+        .arg("-o")
+        .arg(&out_path)
+        .arg("--model")
+        .arg(&opts.model)
+        .arg("-c")
+        .arg(format!("model_reasoning_effort={REASONING_EFFORT}"))
         .current_dir(&opts.repo_root)
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())

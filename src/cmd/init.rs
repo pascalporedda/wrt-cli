@@ -24,10 +24,14 @@ pub fn cmd_init(
     }
 
     log.infof("running codex discovery (writes .wrt.json config)");
-    let (raw, _) = match codex::discover(codex::DiscoverOpts {
+    let mut opts = codex::DiscoverOpts {
         repo_root: discovery_root.to_path_buf(),
-        model,
-    }) {
+        ..Default::default()
+    };
+    if let Some(model) = model {
+        opts.model = model;
+    }
+    let (raw, _) = match codex::discover(opts) {
         Ok(v) => v,
         Err(e) => {
             log.errorf(&format!("{e}"));

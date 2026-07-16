@@ -1,0 +1,7 @@
+interface:
+  display_name: "WRT Worktrees"
+  short_description: "Manage agent worktrees safely with wrt"
+  default_prompt: "Use $wrt-worktrees to create and manage this task in a wrt worktree."
+
+policy:
+  allow_implicit_invocation: true

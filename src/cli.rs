@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 pub const USAGE_TEXT: &str = r#"wrt: git worktree helper geared for parallel (agentic) workflows
 
 Usage:
-  wrt init [--force] [--print] [--model <codex-model>]
+  wrt init [--force] [--print] [--model <codex-model>]  (default model: gpt-5.6-sol, reasoning medium)
   wrt clone <git-repo-url> [--root <dir>] [--main <branch>] [--install auto|true|false] [--supabase auto|true|false] [--supabase-config <path>] [--db auto|true|false]
   wrt root init <source> --root <dir> [--main <branch>] [--install auto|true|false] [--supabase auto|true|false] [--supabase-config <path>] [--db auto|true|false]
   wrt root status

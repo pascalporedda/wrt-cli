@@ -75,7 +75,6 @@ pub fn cmd_root_init(log: &ui::Logger, opts: RootInitOpts<'_>) -> Result<i32> {
 
     let root = cwd.join(opts.root);
     let git_dir = root.join(".git");
-    let main_path = root.join("main");
 
     if git_dir.exists() {
         log.errorf(&format!("{} already exists", git_dir.display()));
@@ -123,6 +122,7 @@ pub fn cmd_root_init(log: &ui::Logger, opts: RootInitOpts<'_>) -> Result<i32> {
         Some(branch) => worktree::normalize_branch(branch),
         None => default_branch(&git_dir).unwrap_or_else(|| "main".to_string()),
     };
+    let main_path = root.join(worktree::slug(&branch));
 
     log.infof(&format!(
         "creating main worktree: {} ({branch})",
