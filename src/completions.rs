@@ -70,7 +70,8 @@ _wrt() {
             '--from=[Start ref]:ref:' \
             '--branch=[Branch name]:branch:' \
             '--install=[Install deps]:mode:(auto true false)' \
-            '--supabase=[Supabase]:mode:(auto true false)' \
+            '--supabase=[Supabase]:mode:(auto shared isolated none true false)' \
+            '--supabase-config=[Repo-relative Supabase config path]:file:_files' \
             '--db=[DB setup]:mode:(auto true false)' \
             '--cd[Print cd snippet]'
           return
@@ -82,6 +83,7 @@ _wrt() {
             '--main=[Main branch]:branch:' \
             '--install=[Install deps]:mode:(auto true false)' \
             '--supabase=[Supabase]:mode:(auto true false)' \
+            '--supabase-config=[Repo-relative Supabase config path]:file:_files' \
             '--db=[DB setup]:mode:(auto true false)'
           return
           ;;
@@ -101,6 +103,7 @@ _wrt() {
                 '--main=[Main branch]:branch:' \
                 '--install=[Install deps]:mode:(auto true false)' \
                 '--supabase=[Supabase]:mode:(auto true false)' \
+                '--supabase-config=[Repo-relative Supabase config path]:file:_files' \
                 '--db=[DB setup]:mode:(auto true false)'
               return
               ;;

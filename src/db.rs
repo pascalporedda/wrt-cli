@@ -1,15 +1,17 @@
 use crate::codex;
+use crate::supabase;
 use std::fs;
 use std::path::Path;
 
-pub fn has_supabase_seed_or_migrations(root: &Path) -> bool {
-    let sb = root.join("supabase");
+pub fn has_supabase_seed_or_migrations(root: &Path, target: &supabase::Target) -> bool {
+    let sb = target.workdir(root).join("supabase");
     sb.join("seed.sql").exists() || sb.join("migrations").is_dir()
 }
 
 pub fn command(
     config_root: &Path,
     wt_path: &Path,
+    supabase_target: Option<&supabase::Target>,
     op: &str,
 ) -> (Option<String>, Option<Vec<String>>) {
     let mut kind = None;
@@ -39,7 +41,10 @@ pub fn command(
         }
     }
 
-    if cmd.is_none() && op == "reset" && has_supabase_seed_or_migrations(wt_path) {
+    if cmd.is_none()
+        && op == "reset"
+        && supabase_target.is_some_and(|target| has_supabase_seed_or_migrations(wt_path, target))
+    {
         kind = kind.or(Some("supabase".into()));
         cmd = Some(vec!["supabase".into(), "db".into(), "reset".into()]);
     }

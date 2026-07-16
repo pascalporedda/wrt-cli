@@ -22,7 +22,7 @@ Output guidance:
   - Only support these tooling kinds: supabase, prisma, sqlx. If unclear, set database.kind to "unknown" or null.
   - Prefer providing a reset command when possible (reset is the best "one-shot" local setup).
   - Supabase:
-    - Detect via `supabase/` and/or `supabase/config.toml`.
+  - Search for any repo-relative path ending in `supabase/config.toml`, including nested monorepo projects.
     - Set database.kind="supabase".
     - reset_command: ["supabase","db","reset"] (preferred).
     - migrate_command/seed_command: optional; can be null if reset covers it.
@@ -39,7 +39,7 @@ Output guidance:
     - migrate_command: ["cargo","sqlx","migrate","run"] (if migrations exist).
     - reset_command: often not available; set null unless the repo defines a clear reset script/command.
     - seed_command: set null unless the repo has an explicit seed script.
-- supabase.detected: true only if supabase/config.toml exists
-- supabase.config_path: "supabase/config.toml" if detected, otherwise null
+- supabase.detected: true only if a `supabase/config.toml` file exists
+- supabase.config_path: the exact repo-relative path to that file if detected, otherwise null
 - supabase.start_command: ["supabase","start"] if detected, otherwise null
 - supabase.base_ports: include any known ports (null for unknown ports; null for the whole object if not detected)

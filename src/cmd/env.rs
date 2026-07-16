@@ -35,6 +35,6 @@ pub fn cmd_env(log: &ui::Logger, repo: &gitx::Repo, st: &State, name: Option<&st
         return Ok(2);
     };
 
-    envx::print_exports(repo, a);
+    envx::print_exports(repo, st, a)?;
     Ok(0)
 }

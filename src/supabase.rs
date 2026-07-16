@@ -1,10 +1,195 @@
 use anyhow::{anyhow, Context, Result};
+use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use toml_edit::{value, DocumentMut, InlineTable, Item, Table, Value};
 
-pub fn has_config(repo_root: &Path) -> bool {
-    repo_root.join("supabase").join("config.toml").exists()
+use crate::state::{Allocation, State, SupabaseAllocation};
+
+pub const DEFAULT_CONFIG_PATH: &str = "supabase/config.toml";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Target {
+    config_path: PathBuf,
+    workdir: PathBuf,
+}
+
+impl Target {
+    pub fn from_config_path(path: &str) -> Result<Target> {
+        let path = path.trim();
+        if path.is_empty() {
+            return Err(anyhow!("supabase config path is empty"));
+        }
+
+        let path = Path::new(path);
+        if path.is_absolute() {
+            return Err(anyhow!("supabase config path must be repo-relative"));
+        }
+
+        let mut normalized = PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::Normal(part) => normalized.push(part),
+                Component::CurDir => {}
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Err(anyhow!(
+                        "supabase config path must stay inside the worktree"
+                    ));
+                }
+            }
+        }
+
+        if !normalized.ends_with(Path::new(DEFAULT_CONFIG_PATH)) {
+            return Err(anyhow!(
+                "supabase config path must end with {DEFAULT_CONFIG_PATH}"
+            ));
+        }
+
+        let workdir = normalized
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or_else(|| Path::new(""))
+            .to_path_buf();
+        Ok(Target {
+            config_path: normalized,
+            workdir,
+        })
+    }
+
+    pub fn config_path_string(&self) -> String {
+        self.config_path.to_string_lossy().to_string()
+    }
+
+    pub fn absolute_config_path(&self, repo_root: &Path) -> PathBuf {
+        repo_root.join(&self.config_path)
+    }
+
+    pub fn workdir(&self, repo_root: &Path) -> PathBuf {
+        repo_root.join(&self.workdir)
+    }
+
+    pub fn relative_workdir(&self) -> &Path {
+        &self.workdir
+    }
+}
+
+pub fn resolve_target(
+    repo_root: &Path,
+    explicit: Option<&str>,
+    stored: Option<&str>,
+) -> Result<Target> {
+    let configured = explicit
+        .map(str::to_string)
+        .or_else(|| stored.map(str::to_string))
+        .or_else(|| discovery_config_path(repo_root))
+        .unwrap_or_else(|| DEFAULT_CONFIG_PATH.to_string());
+    Target::from_config_path(&configured)
+}
+
+pub fn has_config(repo_root: &Path, target: &Target) -> bool {
+    target.absolute_config_path(repo_root).is_file()
+}
+
+pub fn allocation_target<'a>(
+    state: &'a State,
+    allocation: &'a Allocation,
+) -> Result<Option<(&'a Allocation, Target)>> {
+    match &allocation.supabase {
+        SupabaseAllocation::Owned { config_path, .. } => {
+            Ok(Some((allocation, Target::from_config_path(config_path)?)))
+        }
+        SupabaseAllocation::Shared { owner } => {
+            let owner = state
+                .allocations
+                .get(owner)
+                .ok_or_else(|| anyhow!("supabase owner worktree is missing: {owner}"))?;
+            let SupabaseAllocation::Owned { config_path, .. } = &owner.supabase else {
+                return Err(anyhow!(
+                    "supabase owner {} does not own a running stack",
+                    owner.name
+                ));
+            };
+            Ok(Some((owner, Target::from_config_path(config_path)?)))
+        }
+        SupabaseAllocation::None => Ok(None),
+    }
+}
+
+pub fn command_workdir(target: Option<&(&Allocation, Target)>, fallback: &Path) -> PathBuf {
+    target
+        .map(|(owner, target)| target.workdir(Path::new(&owner.path)))
+        .unwrap_or_else(|| fallback.to_path_buf())
+}
+
+pub fn project_id(repo_root: &Path, target: &Target) -> Result<String> {
+    let path = target.absolute_config_path(repo_root);
+    let input = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let doc = input
+        .parse::<DocumentMut>()
+        .with_context(|| format!("parse {}", path.display()))?;
+    doc.get("project_id")
+        .and_then(Item::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("{} has no project_id", path.display()))
+}
+
+pub fn ensure_started(repo_root: &Path, target: &Target) -> Result<BTreeMap<String, String>> {
+    if let Ok(status) = status_env(repo_root, target) {
+        return Ok(status);
+    }
+
+    let workdir = target.workdir(repo_root);
+    crate::util::run_cmd(&workdir, "supabase", &["start"])?;
+    status_env(repo_root, target)
+}
+
+pub fn status_env(repo_root: &Path, target: &Target) -> Result<BTreeMap<String, String>> {
+    let workdir = target.workdir(repo_root);
+    let output = Command::new("supabase")
+        .args(["status", "-o", "json"])
+        .current_dir(&workdir)
+        .output()
+        .with_context(|| format!("run supabase status in {}", workdir.display()))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            anyhow!("supabase status failed")
+        } else {
+            anyhow!("supabase status failed: {detail}")
+        });
+    }
+
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("parse `supabase status -o json` output")?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("supabase status JSON must be an object"))?;
+    let mut vars = BTreeMap::new();
+    for (key, value) in object {
+        if let Some(value) = value.as_str() {
+            vars.insert(key.clone(), value.to_string());
+        }
+    }
+    if !vars.contains_key("API_URL") {
+        return Err(anyhow!("supabase status did not return API_URL"));
+    }
+    Ok(vars)
+}
+
+pub fn stop(repo_root: &Path, target: &Target) -> Result<()> {
+    let workdir = target.workdir(repo_root);
+    crate::util::run_cmd(&workdir, "supabase", &["stop"])
+}
+
+fn discovery_config_path(repo_root: &Path) -> Option<String> {
+    let input = fs::read_to_string(repo_root.join(".wrt.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&input).ok()?;
+    value
+        .get("supabase")?
+        .get("config_path")?
+        .as_str()
+        .map(str::to_string)
 }
 
 // patch_config updates supabase/config.toml inside the given worktree directory so multiple local
@@ -12,8 +197,13 @@ pub fn has_config(repo_root: &Path) -> bool {
 // - project_id gets a suffix derived from worktree name
 // - port/shadow_port etc are incremented by offset
 // - localhost URLs with explicit ports get the same offset
-pub fn patch_config(worktree_root: &Path, worktree_name: &str, offset: i32) -> Result<()> {
-    let p = worktree_root.join("supabase").join("config.toml");
+pub fn patch_config(
+    worktree_root: &Path,
+    target: &Target,
+    worktree_name: &str,
+    offset: i32,
+) -> Result<()> {
+    let p = target.absolute_config_path(worktree_root);
     let b = fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
     let mut doc = b
         .parse::<DocumentMut>()
@@ -180,14 +370,7 @@ fn local_url_prefix(s: &str) -> Option<usize> {
 }
 
 fn sanitize_suffix(s: &str) -> String {
-    let mut s = s.trim().to_lowercase();
-
-    // Keep it short; docker resource names can get long fast.
-    if s.len() > 24 {
-        s.truncate(24);
-    }
-
-    // Replace anything non [a-z0-9-] with '-' and compress.
+    let s = s.trim().to_lowercase();
     let mut out = String::new();
     let mut prev_dash = false;
     for ch in s.chars() {
@@ -201,7 +384,17 @@ fn sanitize_suffix(s: &str) -> String {
         }
     }
 
-    out.trim_matches('-').to_string()
+    let out = out.trim_matches('-').to_string();
+    if out.len() <= 24 {
+        return out;
+    }
+
+    let mut hash = 2_166_136_261_u32;
+    for byte in out.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    format!("{}-{hash:08x}", &out[..15])
 }
 
 #[cfg(test)]
@@ -209,10 +402,32 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn target() -> Target {
+        Target::from_config_path(DEFAULT_CONFIG_PATH).unwrap()
+    }
+
+    #[test]
+    fn target_accepts_nested_repo_relative_config() {
+        let target = Target::from_config_path("apps/api/supabase/config.toml").unwrap();
+        assert_eq!(target.config_path_string(), "apps/api/supabase/config.toml");
+        assert_eq!(target.relative_workdir(), Path::new("apps/api"));
+    }
+
+    #[test]
+    fn target_rejects_unsafe_or_nonstandard_paths() {
+        assert!(Target::from_config_path("../supabase/config.toml").is_err());
+        assert!(Target::from_config_path("/tmp/supabase/config.toml").is_err());
+        assert!(Target::from_config_path("apps/api/config.toml").is_err());
+    }
+
     #[test]
     fn sanitize_suffix_limits_and_dashes() {
         assert_eq!(sanitize_suffix("A B C"), "a-b-c");
         assert!(sanitize_suffix("x".repeat(100).as_str()).len() <= 24);
+        assert_ne!(
+            sanitize_suffix("same-very-long-worktree-prefix-one"),
+            sanitize_suffix("same-very-long-worktree-prefix-two")
+        );
     }
 
     #[test]
@@ -238,7 +453,7 @@ mod tests {
         )
         .unwrap();
 
-        patch_config(td.path(), "a-gpt-fix", 200).unwrap();
+        patch_config(td.path(), &target(), "a-gpt-fix", 200).unwrap();
         let out = fs::read_to_string(&p).unwrap();
         assert!(out.contains("project_id = \"myproj-a-gpt-fix\""));
         assert!(out.contains("port = 5632"));
@@ -253,7 +468,7 @@ mod tests {
         let p = sbdir.join("config.toml");
         fs::write(&p, "port = 65500\n").unwrap();
 
-        let result = patch_config(td.path(), "test", 100);
+        let result = patch_config(td.path(), &target(), "test", 100);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -271,7 +486,7 @@ mod tests {
         let p = sbdir.join("config.toml");
         fs::write(&p, "port = 65435\n").unwrap();
 
-        patch_config(td.path(), "test", 100).unwrap();
+        patch_config(td.path(), &target(), "test", 100).unwrap();
         let out = fs::read_to_string(&p).unwrap();
         assert!(
             out.contains("port = 65535"),
@@ -287,10 +502,10 @@ mod tests {
         let p = sbdir.join("config.toml");
         fs::write(&p, "project_id = \"myproj\"\n").unwrap();
 
-        patch_config(td.path(), "wt1", 0).unwrap();
+        patch_config(td.path(), &target(), "wt1", 0).unwrap();
         let after_first = fs::read_to_string(&p).unwrap();
 
-        patch_config(td.path(), "wt1", 0).unwrap();
+        patch_config(td.path(), &target(), "wt1", 0).unwrap();
         let after_second = fs::read_to_string(&p).unwrap();
 
         assert_eq!(
@@ -308,7 +523,7 @@ mod tests {
         let p = sbdir.join("config.toml");
         fs::write(&p, "project_id = \"myproj-wt1\"\n").unwrap();
 
-        patch_config(td.path(), "wt1", 0).unwrap();
+        patch_config(td.path(), &target(), "wt1", 0).unwrap();
         let out = fs::read_to_string(&p).unwrap();
         assert!(
             out.contains("project_id = \"myproj-wt1\""),
@@ -333,7 +548,7 @@ pop3_port = 1100
         )
         .unwrap();
 
-        patch_config(td.path(), "test", 100).unwrap();
+        patch_config(td.path(), &target(), "test", 100).unwrap();
         let out = fs::read_to_string(&p).unwrap();
         assert!(out.contains("port = 5532"), "port not offset: {out}");
         assert!(
@@ -382,7 +597,7 @@ additional_redirect_urls = ["http://localhost:3001/callback", "https://127.0.0.1
         )
         .unwrap();
 
-        patch_config(td.path(), "feature/test", 100).unwrap();
+        patch_config(td.path(), &target(), "feature/test", 100).unwrap();
         let out = fs::read_to_string(&p).unwrap();
         assert!(out.contains("project_id = \"myproj-feature-test\""));
         assert!(out.contains("port = 54421"));
@@ -403,7 +618,7 @@ additional_redirect_urls = ["http://localhost:3001/callback", "https://127.0.0.1
         let p = sbdir.join("config.toml");
         fs::write(&p, "port = 5432 # database port\n").unwrap();
 
-        patch_config(td.path(), "test", 100).unwrap();
+        patch_config(td.path(), &target(), "test", 100).unwrap();
         let out = fs::read_to_string(&p).unwrap();
         assert!(
             out.contains("port = 5532 # database port"),
@@ -414,7 +629,7 @@ additional_redirect_urls = ["http://localhost:3001/callback", "https://127.0.0.1
     #[test]
     fn patch_config_errors_on_missing_file() {
         let td = TempDir::new().unwrap();
-        let result = patch_config(td.path(), "test", 100);
+        let result = patch_config(td.path(), &target(), "test", 100);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(

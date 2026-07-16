@@ -45,7 +45,7 @@ pub fn cmd_run(
         a.path
     ));
 
-    match run_argv_with_wrt_env(repo, Path::new(&a.path), a, command) {
+    match run_argv_with_wrt_env(repo, st, Path::new(&a.path), a, command) {
         Ok(code) => Ok(code),
         Err(e) => {
             log.errorf(&format!("run failed: {e}"));

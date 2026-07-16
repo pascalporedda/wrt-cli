@@ -1,14 +1,14 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 pub const USAGE_TEXT: &str = r#"wrt: git worktree helper geared for parallel (agentic) workflows
 
 Usage:
   wrt init [--force] [--print] [--model <codex-model>]
-  wrt clone <git-repo-url> [--root <dir>] [--main <branch>] [--install auto|true|false] [--supabase auto|true|false] [--db auto|true|false]
-  wrt root init <source> --root <dir> [--main <branch>] [--install auto|true|false] [--supabase auto|true|false] [--db auto|true|false]
+  wrt clone <git-repo-url> [--root <dir>] [--main <branch>] [--install auto|true|false] [--supabase auto|true|false] [--supabase-config <path>] [--db auto|true|false]
+  wrt root init <source> --root <dir> [--main <branch>] [--install auto|true|false] [--supabase auto|true|false] [--supabase-config <path>] [--db auto|true|false]
   wrt root status
-  wrt new <name> [--from <ref>] [--branch <branch>] [--install auto|true|false] [--supabase auto|true|false] [--db auto|true|false] [--cd]
-  wrt add <name> [--from <ref>] [--branch <branch>] [--install auto|true|false] [--supabase auto|true|false] [--db auto|true|false] [--cd]
+  wrt new <name> [--from <ref>] [--branch <branch>] [--install auto|true|false] [--supabase auto|shared|isolated|none] [--supabase-config <path>] [--db auto|true|false] [--cd]
+  wrt add <name> [--from <ref>] [--branch <branch>] [--install auto|true|false] [--supabase auto|shared|isolated|none] [--supabase-config <path>] [--db auto|true|false] [--cd]
   wrt db [<name>] reset|seed|migrate [--print]
   wrt ls
   wrt path <name>
@@ -24,7 +24,7 @@ Conventions:
   - Managed roots live under: <root>/.git + <root>/main + <root>/<feature>
   - Feature worktrees live as siblings of main: <root>/<name>
   - Each worktree gets a reserved "port block" (offset = block*100); block 0 is kept for the main workdir.
-  - If a Supabase config exists (supabase/config.toml), wrt can patch it to avoid port/container collisions.
+  - Supabase repos get one shared main instance; feature worktrees can reuse it or request isolation.
   - If DB reset/seed commands are discovered (via .wrt.json), wrt can optionally run them after setup.
 "#;
 
@@ -35,6 +35,23 @@ Conventions:
 pub struct Cli {
     #[command(subcommand)]
     pub cmd: Option<Cmd>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum RootSupabaseMode {
+    Auto,
+    True,
+    False,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum FeatureSupabaseMode {
+    Auto,
+    Shared,
+    #[value(alias = "true")]
+    Isolated,
+    #[value(alias = "false")]
+    None,
 }
 
 #[derive(Subcommand, Debug)]
@@ -61,8 +78,10 @@ pub enum Cmd {
         main: Option<String>,
         #[arg(long, default_value = "auto")]
         install: String,
-        #[arg(long, default_value = "auto")]
-        supabase: String,
+        #[arg(long, value_enum, default_value_t = RootSupabaseMode::Auto)]
+        supabase: RootSupabaseMode,
+        #[arg(long = "supabase-config", value_name = "PATH")]
+        supabase_config: Option<String>,
         #[arg(long, default_value = "auto")]
         db: String,
     },
@@ -73,7 +92,7 @@ pub enum Cmd {
         action: RootAction,
     },
 
-    /// Create a new worktree (+branch), optionally install deps and start supabase
+    /// Create a new worktree (+branch), optionally install deps and set up supabase
     #[command(visible_alias = "add")]
     New {
         name: String,
@@ -83,8 +102,10 @@ pub enum Cmd {
         branch: Option<String>,
         #[arg(long, default_value = "auto")]
         install: String,
-        #[arg(long, default_value = "auto")]
-        supabase: String,
+        #[arg(long, value_enum, default_value_t = FeatureSupabaseMode::Auto)]
+        supabase: FeatureSupabaseMode,
+        #[arg(long = "supabase-config", value_name = "PATH")]
+        supabase_config: Option<String>,
         #[arg(long, default_value = "auto")]
         db: String,
         /// Print a `cd <path>` snippet to stdout after creation (use with `eval "$(wrt new ... --cd)"`)
@@ -183,8 +204,10 @@ pub enum RootAction {
         main: Option<String>,
         #[arg(long, default_value = "auto")]
         install: String,
-        #[arg(long, default_value = "auto")]
-        supabase: String,
+        #[arg(long, value_enum, default_value_t = RootSupabaseMode::Auto)]
+        supabase: RootSupabaseMode,
+        #[arg(long = "supabase-config", value_name = "PATH")]
+        supabase_config: Option<String>,
         #[arg(long, default_value = "auto")]
         db: String,
     },

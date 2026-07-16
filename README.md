@@ -41,7 +41,7 @@ The pain is always the same:
 | **Managed roots** | Can clone/bootstrap `<root>/.git` as a bare common repo with `<root>/main` and `<root>/<feature>` checkouts |
 | **Port block reservation** | Allocates a unique `WRT_PORT_BLOCK` per worktree (offset = `block * 100`) |
 | **Shell-friendly env** | Writes `.wrt.env` into each worktree and can print `export ...` lines for your shell |
-| **Supabase isolation** | Patches `supabase/config.toml` (project_id suffix + port offsets + localhost URLs) and sets `skip-worktree` |
+| **Supabase sharing + isolation** | Starts one main stack, lets features share it or create isolated stacks, and supports nested config paths |
 | **Run inside worktree** | `wrt run <name> -- ...` runs a command in that worktree with `WRT_*` set |
 | **State tracking** | Tracks worktrees in `<git-common-dir>/.wrt/state.json` and can prune missing entries |
 | **Repo discovery (optional)** | `wrt init` can call the Codex CLI to generate managed-root `.wrt.json` conventions |
@@ -55,7 +55,7 @@ The pain is always the same:
 cargo install --path .
 
 # clone into a managed root
-wrt clone git@github.com:org/app.git --install false --supabase false
+wrt clone git@github.com:org/app.git --install false
 cd app
 
 # optional: generates shared .wrt.json via Codex at the managed root
@@ -76,7 +76,7 @@ echo "$WRT_PORT_OFFSET"
 Managed-root layout:
 
 ```bash
-wrt clone git@github.com:org/app.git --install false --supabase false
+wrt clone git@github.com:org/app.git --install false
 cd app
 wrt new a/gpt/login-timeout
 cd "$(wrt path a-gpt-login-timeout)"
@@ -126,11 +126,11 @@ wrt run a-gpt-login-timeout -- sh -lc 'echo $WRT_NAME && env | rg ^WRT_'
 
 ```text
 wrt init [--force] [--print] [--model <codex-model>]
-wrt clone <git-repo-url> [--root <dir>] [--main <branch>] [--install auto|true|false] [--supabase auto|true|false] [--db auto|true|false]
-wrt root init <source> --root <dir> [--main <branch>] [--install auto|true|false] [--supabase auto|true|false] [--db auto|true|false]
+wrt clone <git-repo-url> [--root <dir>] [--main <branch>] [--install auto|true|false] [--supabase auto|true|false] [--supabase-config <path>] [--db auto|true|false]
+wrt root init <source> --root <dir> [--main <branch>] [--install auto|true|false] [--supabase auto|true|false] [--supabase-config <path>] [--db auto|true|false]
 wrt root status
-wrt new <name> [--from <ref>] [--branch <branch>] [--install auto|true|false] [--supabase auto|true|false] [--db auto|true|false] [--cd]
-wrt add <name> [--from <ref>] [--branch <branch>] [--install auto|true|false] [--supabase auto|true|false] [--db auto|true|false] [--cd]
+wrt new <name> [--from <ref>] [--branch <branch>] [--install auto|true|false] [--supabase auto|shared|isolated|none] [--supabase-config <path>] [--db auto|true|false] [--cd]
+wrt add <name> [--from <ref>] [--branch <branch>] [--install auto|true|false] [--supabase auto|shared|isolated|none] [--supabase-config <path>] [--db auto|true|false] [--cd]
 wrt db [<name>] reset|seed|migrate [--print]
 wrt ls
 wrt path <name>
@@ -151,24 +151,30 @@ wrt new perf/agent-01 --from origin/main
 wrt add perf/agent-02 --from origin/main
 
 # create a managed root with sibling worktrees
-wrt clone git@github.com:org/app.git --install false --supabase false
+wrt clone git@github.com:org/app.git --install false
 cd app
 wrt new perf/agent-01
 
 # create a managed root from an existing local checkout
-wrt root init . --root ../my-repo-wrt --install false --supabase false
+wrt root init . --root ../my-repo-wrt --install false
 cd ../my-repo-wrt
 wrt root status
 wrt new perf/agent-01
 
 # create and jump into it (shell integration)
-eval "$(wrt new a/gpt/login-timeout --cd --install false --supabase false)"
+eval "$(wrt new a/gpt/login-timeout --cd --install false)"
 
 # keep the directory slugged but force a branch name
 wrt new "Agent 02: API cleanup" --branch agent/api-cleanup
 
-# skip dependency install and supabase
-wrt new x --install false --supabase false
+# explicitly create an isolated feature stack
+wrt new x --supabase isolated
+
+# explicitly skip Supabase for this worktree
+wrt new docs-only --supabase none
+
+# persist a nested Supabase project path for main and future worktrees
+wrt clone git@github.com:org/monorepo.git --supabase-config apps/api/supabase/config.toml
 
 # remove worktree (and optionally the branch ref)
 wrt rm x --force
@@ -194,11 +200,16 @@ wrt housekeeping
 - **State**
   - tracked in `<git-common-dir>/.wrt/state.json` (usually `.git/.wrt/state.json`)
   - block `0` is reserved for the main workdir; first worktree usually gets block `1` => offset `100`
+  - Supabase ownership and the repo-relative config path are persisted; credentials are not
 - **Environment**
   - `.wrt.env`, `wrt env`, and `wrt run` share one environment resolver
   - generated vars include `WRT_ROOT`, `WRT_WORKTREE_PATH`, `WRT_MAIN_PATH`, `COMPOSE_PROJECT_NAME`, and discovered service port/url vars from checkout-local `.wrt.json` or the managed-root `.wrt.json`
+  - Supabase values are read from `supabase status -o json` and synchronized into generated blocks in `.env` and the Supabase workdir's `.env`
+  - if an `.env` is tracked, wrt leaves it unchanged and writes the generated block to `.env.local`
 - **Git excludes**
   - `wrt` appends these to `.git/info/exclude` to reduce accidental commits:
+    - `.env`
+    - `.env.local`
     - `.wrt.env`
     - `.wrt.json`
 
@@ -206,12 +217,20 @@ wrt housekeeping
 <summary><b>Supabase patching details</b></summary>
 <br>
 
-If `supabase/config.toml` exists inside the worktree, `wrt` can patch it for isolation:
+When clone detects a Supabase config, it starts one unpatched stack from `main`. `wrt new`/`wrt add` asks whether to create an isolated stack; answering no reuses main. In non-interactive use, `auto` reuses main when available and otherwise disables Supabase.
+
+- `--supabase shared` reuses the main stack
+- `--supabase isolated` patches and starts a feature-owned stack
+- `--supabase none` disables Supabase for that worktree
+- `--supabase-config apps/api/supabase/config.toml` persists an alternative repo-relative path
+- `true` and `false` remain aliases for `isolated` and `none` on feature commands
+
+For isolated stacks:
 
 - `project_id` gets a short suffix derived from the worktree name
 - `port`, `shadow_port`, `smtp_port`, `pop3_port` are incremented by `WRT_PORT_OFFSET` across nested TOML sections
 - `http://localhost:<port>` / `http://127.0.0.1:<port>` URL ports inside the config are also incremented
-- `supabase/config.toml` is marked `skip-worktree` in that worktree to reduce accidental commits
+- the effective config path is marked `skip-worktree` in that worktree to reduce accidental commits
 
 </details>
 
@@ -222,7 +241,8 @@ If `supabase/config.toml` exists inside the worktree, `wrt` can patch it for iso
 - `wrt` commands operate only inside managed roots created by `wrt clone` or `wrt root init`
 - `wrt run` must be invoked with `--` exactly like `wrt run <name> -- <command> ...` (otherwise it exits with code `2`)
 - `wrt env` with no `<name>` only works when you run it from inside a tracked worktree (it infers from `cwd`)
-- `wrt new --supabase auto` patches config if it sees `supabase/config.toml`, but it only runs `supabase start` if the Supabase CLI exists in `PATH`
+- Clone fails its setup phase if a detected Supabase project cannot start or report status. The managed root and failed state remain available for recovery.
+- Shared features never automatically reset the main database. Use explicit DB commands or `--db true` when destructive setup is intended.
 - `wrt clone` / `wrt root init` clone committed Git state. They copy `.env` into `main` and `.wrt.json` into the managed root only when the source is a local directory and those files exist.
 - Worktree name slugging is intentionally strict. If your `<name>` turns into an empty slug, it becomes `wrt`
 
@@ -268,16 +288,22 @@ wrt init --print
 
 ```bash
 # Run from source
-cargo run -- help
+just run help
 
-# Tests
-cargo test
+# Run formatting, linting, build, and tests
+just check
 
 # Format
-cargo fmt
+just fmt
 
 # Lint
-cargo clippy --all-targets -- -D warnings
+just lint
+
+# Build
+just build
+
+# Tests
+just test
 ```
 
 ---

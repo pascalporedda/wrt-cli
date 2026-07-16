@@ -3,9 +3,10 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use crate::cli::RootSupabaseMode;
 use crate::cmd::new::{setup_existing_worktree, SetupModes};
 use crate::gitx;
-use crate::state::{Allocation, RootState, State, LAYOUT_MANAGED_ROOT};
+use crate::state::{Allocation, RootState, State, SupabaseAllocation, LAYOUT_MANAGED_ROOT};
 use crate::supabase;
 use crate::ui;
 use crate::util::run_cmd;
@@ -16,7 +17,8 @@ pub struct RootInitOpts<'a> {
     pub root: &'a str,
     pub main: Option<&'a str>,
     pub install_mode: &'a str,
-    pub sb_mode: &'a str,
+    pub sb_mode: RootSupabaseMode,
+    pub supabase_config: Option<&'a str>,
     pub db_mode: &'a str,
 }
 
@@ -25,7 +27,8 @@ pub struct CloneOpts<'a> {
     pub root: Option<&'a str>,
     pub main: Option<&'a str>,
     pub install_mode: &'a str,
-    pub sb_mode: &'a str,
+    pub sb_mode: RootSupabaseMode,
+    pub supabase_config: Option<&'a str>,
     pub db_mode: &'a str,
 }
 
@@ -40,13 +43,37 @@ pub fn cmd_clone(log: &ui::Logger, opts: CloneOpts<'_>) -> Result<i32> {
         main: opts.main,
         install_mode: opts.install_mode,
         sb_mode: opts.sb_mode,
+        supabase_config: opts.supabase_config,
         db_mode: opts.db_mode,
     };
     cmd_root_init(log, init)
 }
 
 pub fn cmd_root_init(log: &ui::Logger, opts: RootInitOpts<'_>) -> Result<i32> {
-    let root = std::env::current_dir()?.join(opts.root);
+    let cwd = std::env::current_dir()?;
+    let source = Path::new(opts.source);
+    let source = if source.is_absolute() {
+        source.to_path_buf()
+    } else {
+        cwd.join(source)
+    };
+    let target = if source.is_dir() {
+        supabase::resolve_target(&source, opts.supabase_config, None)
+    } else {
+        supabase::Target::from_config_path(
+            opts.supabase_config
+                .unwrap_or(supabase::DEFAULT_CONFIG_PATH),
+        )
+    };
+    let target = match target {
+        Ok(target) => target,
+        Err(error) => {
+            log.errorf(&format!("invalid Supabase config: {error}"));
+            return Ok(2);
+        }
+    };
+
+    let root = cwd.join(opts.root);
     let git_dir = root.join(".git");
     let main_path = root.join("main");
 
@@ -115,9 +142,39 @@ pub fn cmd_root_init(log: &ui::Logger, opts: RootInitOpts<'_>) -> Result<i32> {
         return Ok(1);
     }
 
-    copy_source_overlays(opts.source, &root, &main_path);
+    copy_source_overlays(&source, &root, &main_path);
 
     let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let has_supabase = supabase::has_config(&main_path, &target);
+    if has_supabase {
+        let _ = worktree::copy_repo_env_at(&source, &main_path, target.relative_workdir());
+    }
+    let mut setup_failure = if opts.supabase_config.is_some() && !has_supabase {
+        Some(format!(
+            "supabase config not found: {}",
+            target.absolute_config_path(&main_path).display()
+        ))
+    } else if opts.sb_mode == RootSupabaseMode::True && !has_supabase {
+        Some("--supabase true requires a Supabase config".to_string())
+    } else {
+        None
+    };
+    let supabase_state =
+        if setup_failure.is_none() && opts.sb_mode != RootSupabaseMode::False && has_supabase {
+            match supabase::project_id(&main_path, &target) {
+                Ok(project_id) => SupabaseAllocation::Owned {
+                    project_id,
+                    config_path: target.config_path_string(),
+                },
+                Err(error) => {
+                    setup_failure = Some(format!("read Supabase project ID failed: {error}"));
+                    SupabaseAllocation::None
+                }
+            }
+        } else {
+            SupabaseAllocation::None
+        };
+
     let alloc = Allocation {
         name: "main".to_string(),
         branch: branch.clone(),
@@ -126,6 +183,7 @@ pub fn cmd_root_init(log: &ui::Logger, opts: RootInitOpts<'_>) -> Result<i32> {
         offset: 0,
         status: "creating".to_string(),
         created_at: created_at.clone(),
+        supabase: supabase_state,
     };
 
     let mut st = State::empty();
@@ -136,10 +194,21 @@ pub fn cmd_root_init(log: &ui::Logger, opts: RootInitOpts<'_>) -> Result<i32> {
         main_worktree: main_path.to_string_lossy().to_string(),
         worktrees_path: root.to_string_lossy().to_string(),
         created_at,
+        supabase_config_path: (opts.supabase_config.is_some() || has_supabase)
+            .then(|| target.config_path_string()),
     });
     st.allocations.insert("main".to_string(), alloc.clone());
     st.save(&git_dir)?;
-    let _ = gitx::ensure_info_exclude(&git_dir, &[".wrt.env", ".wrt.json"]);
+    let _ = gitx::ensure_info_exclude(&git_dir, &[".env", ".env.local", ".wrt.env", ".wrt.json"]);
+
+    if let Some(error) = setup_failure {
+        if let Some(a) = st.allocations.get_mut("main") {
+            a.status = "failed".to_string();
+        }
+        st.save(&git_dir)?;
+        log.errorf(&error);
+        return Ok(1);
+    }
 
     let repo = gitx::Repo::new(
         root.clone(),
@@ -150,11 +219,10 @@ pub fn cmd_root_init(log: &ui::Logger, opts: RootInitOpts<'_>) -> Result<i32> {
     );
     let modes = SetupModes {
         install_mode: opts.install_mode,
-        sb_mode: opts.sb_mode,
         db_mode: opts.db_mode,
     };
 
-    if let Err(e) = setup_existing_worktree(log, &repo, &alloc, &main_path, modes) {
+    if let Err(e) = setup_existing_worktree(log, &repo, &mut st, "main", &main_path, modes) {
         if let Some(a) = st.allocations.get_mut("main") {
             a.status = "failed".to_string();
         }
@@ -194,13 +262,20 @@ pub fn cmd_root_status(log: &ui::Logger, repo: &gitx::Repo, st: &State) -> Resul
     }
     println!("tracked worktrees: {}", st.allocations.len());
 
-    let main_path = Path::new(&root.main_worktree);
-    let supabase_status = if supabase::has_config(main_path) {
-        "patched"
-    } else {
-        "none"
-    };
+    let supabase_status = st
+        .allocations
+        .get("main")
+        .map(|allocation| match &allocation.supabase {
+            SupabaseAllocation::Owned { .. } => "shared main",
+            SupabaseAllocation::None => "none",
+            SupabaseAllocation::Shared { .. } => "invalid shared binding",
+        })
+        .unwrap_or("none");
     println!("supabase config: {supabase_status}");
+    println!(
+        "supabase config path: {}",
+        root.supabase_config_path.as_deref().unwrap_or("(default)")
+    );
     Ok(0)
 }
 
@@ -252,16 +327,7 @@ fn default_branch(git_dir: &Path) -> Option<String> {
         })
 }
 
-fn copy_source_overlays(source: &str, managed_root: &Path, main_path: &Path) {
-    let source_path = Path::new(source);
-    let source_path = if source_path.is_absolute() {
-        source_path.to_path_buf()
-    } else {
-        match std::env::current_dir() {
-            Ok(cwd) => cwd.join(source_path),
-            Err(_) => return,
-        }
-    };
+fn copy_source_overlays(source_path: &Path, managed_root: &Path, main_path: &Path) {
     if !source_path.is_dir() {
         return;
     }

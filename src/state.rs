@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 const STATE_DIR_NAME: &str = ".wrt";
 const STATE_FILE_NAME: &str = "state.json";
-const CURRENT_VER: i32 = 2;
+const CURRENT_VER: i32 = 3;
 
 pub const LAYOUT_MANAGED_ROOT: &str = "managed-root";
 
@@ -33,6 +33,8 @@ pub struct RootState {
     pub worktrees_path: String,
     #[serde(rename = "createdAt")]
     pub created_at: String,
+    #[serde(default, rename = "supabaseConfigPath")]
+    pub supabase_config_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -45,6 +47,24 @@ pub struct Allocation {
     pub status: String,
     #[serde(rename = "createdAt")]
     pub created_at: String,
+    #[serde(default)]
+    pub supabase: SupabaseAllocation,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "kebab-case")]
+pub enum SupabaseAllocation {
+    #[default]
+    None,
+    Owned {
+        #[serde(rename = "projectId")]
+        project_id: String,
+        #[serde(rename = "configPath")]
+        config_path: String,
+    },
+    Shared {
+        owner: String,
+    },
 }
 
 impl State {
@@ -68,7 +88,7 @@ impl State {
             serde_json::from_slice(&b).with_context(|| format!("parse {}", p.display()))?;
         if st.version != CURRENT_VER {
             return Err(anyhow!(
-                "unsupported wrt state version {}; expected {CURRENT_VER}",
+                "unsupported wrt state version {}; expected {CURRENT_VER}; recreate the managed root with `wrt clone` or `wrt root init`",
                 st.version
             ));
         }
@@ -125,6 +145,7 @@ mod tests {
                 offset: 100,
                 status: "active".to_string(),
                 created_at: "x".to_string(),
+                supabase: SupabaseAllocation::None,
             },
         );
         st.allocations.insert(
@@ -137,6 +158,7 @@ mod tests {
                 offset: 300,
                 status: "active".to_string(),
                 created_at: "x".to_string(),
+                supabase: SupabaseAllocation::None,
             },
         );
 
@@ -144,17 +166,17 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_old_state_versions() {
+    fn load_rejects_version_two_state() {
         let td = tempfile::TempDir::new().unwrap();
         let state_dir = td.path().join(".wrt");
         fs::create_dir_all(&state_dir).unwrap();
         fs::write(
             state_dir.join("state.json"),
-            r#"{"version":1,"allocations":{"x":{"name":"x","branch":"x","path":"/tmp/x","block":1,"offset":100,"status":"active","createdAt":"now"}}}"#,
+            r#"{"version":2,"allocations":{"x":{"name":"x","branch":"x","path":"/tmp/x","block":1,"offset":100,"status":"active","createdAt":"now"}}}"#,
         )
         .unwrap();
 
-        let err = State::load(td.path()).unwrap_err().to_string();
-        assert!(err.contains("unsupported wrt state version"), "{err}");
+        let error = State::load(td.path()).unwrap_err().to_string();
+        assert!(error.contains("unsupported wrt state version"), "{error}");
     }
 }

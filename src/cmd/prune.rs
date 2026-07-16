@@ -22,6 +22,9 @@ pub fn cmd_prune(log: &ui::Logger, repo: &gitx::Repo, st: &mut State) -> Result<
             .map(|a| !Path::new(&a.path).exists())
             .unwrap_or(false);
         if missing {
+            if k == "main" {
+                continue;
+            }
             st.allocations.remove(&k);
             removed += 1;
         }

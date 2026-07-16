@@ -100,14 +100,13 @@ fn init_bare_managed_without_main() -> (TempDir, TempDir) {
             git_dir.to_str().unwrap(),
         ],
     );
-
     let state_dir = git_dir.join(".wrt");
     fs::create_dir_all(&state_dir).unwrap();
     fs::write(
         state_dir.join("state.json"),
         format!(
             r#"{{
-  "version": 2,
+  "version": 3,
   "root": {{
     "layout": "managed-root",
     "managedRoot": "{root}",
@@ -173,6 +172,25 @@ fn write_mock_bin(dir: &Path, name: &str, body: &str) {
     let mut perms = fs::metadata(&path).unwrap().permissions();
     perms.set_mode(0o755);
     fs::set_permissions(path, perms).unwrap();
+}
+
+#[cfg(unix)]
+fn write_mock_supabase(dir: &Path) {
+    write_mock_bin(
+        dir,
+        "supabase",
+        r#"#!/bin/sh
+printf 'supabase %s [%s]\n' "$*" "$PWD" >> "$MOCK_LOG"
+case "$1" in
+  status)
+    test -f .mock_supabase_started || exit 1
+    printf '{"API_URL":"http://127.0.0.1:54321","DB_URL":"postgresql://postgres:postgres@127.0.0.1:54322/postgres","ANON_KEY":"anon","SERVICE_ROLE_KEY":"service","JWT_SECRET":"jwt","STUDIO_URL":"http://127.0.0.1:54323"}\n'
+    ;;
+  start) touch .mock_supabase_started ;;
+  stop) rm -f .mock_supabase_started ;;
+esac
+"#,
+    );
 }
 
 #[test]
@@ -319,8 +337,9 @@ fn env_reads_managed_root_config_when_checkout_has_none() {
         ));
 }
 
+#[cfg(unix)]
 #[test]
-fn new_patches_supabase_and_sets_skip_worktree_when_auto() {
+fn new_patches_supabase_and_sets_skip_worktree_when_isolated() {
     let source = init_repo();
 
     let sbdir = source.path().join("supabase");
@@ -344,11 +363,16 @@ fn new_patches_supabase_and_sets_skip_worktree_when_auto() {
         ],
     );
     let (_source, td) = init_managed_from(source);
+    let bin = TempDir::new().unwrap();
+    let log = td.path().join("supabase.log");
+    write_mock_supabase(bin.path());
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
 
     let mut cmd = wrt_cmd();
     cmd.current_dir(td.path())
-        .args(["new", "x", "--install", "false", "--supabase", "auto"]);
-    set_minimal_path(&mut cmd);
+        .env("PATH", path)
+        .env("MOCK_LOG", log)
+        .args(["new", "x", "--install", "false", "--supabase", "isolated"]);
     cmd.assert().success();
 
     let wt_dir = worktree_path(&td, "x");
@@ -550,11 +574,7 @@ fn new_runs_mocked_package_install_and_supabase_lifecycle() {
         "pnpm",
         "#!/bin/sh\nprintf 'pnpm %s\\n' \"$*\" >> \"$MOCK_LOG\"\n",
     );
-    write_mock_bin(
-        bin.path(),
-        "supabase",
-        "#!/bin/sh\nprintf 'supabase %s\\n' \"$*\" >> \"$MOCK_LOG\"\n",
-    );
+    write_mock_supabase(bin.path());
     let path = format!("{}:/usr/bin:/bin", bin.path().display());
 
     wrt_cmd()
@@ -586,6 +606,392 @@ fn new_runs_mocked_package_install_and_supabase_lifecycle() {
     assert!(log.contains("pnpm install"), "{log}");
     assert!(log.contains("supabase start"), "{log}");
     assert!(log.contains("supabase stop"), "{log}");
+}
+
+#[cfg(unix)]
+#[test]
+fn nested_supabase_config_supports_shared_and_isolated_features() {
+    let source = init_repo();
+    let project = source.path().join("apps").join("api");
+    let sbdir = project.join("supabase");
+    fs::create_dir_all(&sbdir).unwrap();
+    fs::write(
+        sbdir.join("config.toml"),
+        "project_id = \"myproj\"\n[api]\nport = 54321\n[db]\nport = 54322\n",
+    )
+    .unwrap();
+    fs::write(source.path().join(".env"), "TRACKED=value\n").unwrap();
+    fs::create_dir_all(sbdir.join("migrations")).unwrap();
+    fs::write(sbdir.join("migrations/001_init.sql"), "select 1;\n").unwrap();
+    let alternate_config = "services/alt/supabase/config.toml";
+    let alternate = source.path().join(alternate_config);
+    fs::create_dir_all(alternate.parent().unwrap()).unwrap();
+    fs::write(
+        &alternate,
+        "project_id = \"altproj\"\n[api]\nport = 55000\n",
+    )
+    .unwrap();
+    git(source.path(), &["add", "."]);
+    git(
+        source.path(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-m",
+            "add nested supabase",
+        ],
+    );
+    fs::write(project.join(".env"), "CUSTOM_NESTED=value\n").unwrap();
+
+    let managed = TempDir::new().unwrap();
+    let bin = TempDir::new().unwrap();
+    let log = source.path().join("supabase.log");
+    write_mock_supabase(bin.path());
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+    let config_path = "apps/api/supabase/config.toml";
+
+    wrt_cmd()
+        .current_dir(source.path())
+        .env("PATH", &path)
+        .env("MOCK_LOG", &log)
+        .args([
+            "root",
+            "init",
+            source.path().to_str().unwrap(),
+            "--root",
+            managed.path().to_str().unwrap(),
+            "--install",
+            "false",
+            "--supabase-config",
+            config_path,
+            "--db",
+            "false",
+        ])
+        .assert()
+        .success();
+
+    let main = main_path(&managed);
+    let main_config = fs::read_to_string(main.join(config_path)).unwrap();
+    assert!(main_config.contains("project_id = \"myproj\""));
+    assert!(!main_config.contains("myproj-main"));
+    assert_eq!(
+        fs::read_to_string(main.join(".env")).unwrap(),
+        "TRACKED=value\n"
+    );
+    assert!(git_out(&main, &["diff", "--", ".env"]).is_empty());
+    let main_env = fs::read_to_string(main.join(".env.local")).unwrap();
+    assert!(main_env.contains("SUPABASE_URL='http://127.0.0.1:54321'"));
+    let nested_env = fs::read_to_string(main.join("apps/api/.env")).unwrap();
+    assert!(nested_env.contains("CUSTOM_NESTED=value"));
+    assert!(nested_env.contains("SUPABASE_URL='http://127.0.0.1:54321'"));
+
+    wrt_cmd()
+        .current_dir(managed.path())
+        .env("PATH", &path)
+        .env("MOCK_LOG", &log)
+        .args(["add", "feature/shared", "--install", "false"])
+        .assert()
+        .success();
+
+    let shared = worktree_path(&managed, "feature-shared");
+    let shared_config = fs::read_to_string(shared.join(config_path)).unwrap();
+    assert!(shared_config.contains("project_id = \"myproj\""));
+    assert!(!shared_config.contains("myproj-feature-shared"));
+    assert!(fs::read_to_string(shared.join(".wrt.env"))
+        .unwrap()
+        .contains("WRT_SUPABASE_OWNER='main'"));
+    assert!(fs::read_to_string(shared.join("apps/api/.env"))
+        .unwrap()
+        .contains("CUSTOM_NESTED=value"));
+    let state_path = managed.path().join(".git/.wrt/state.json");
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&state_path).unwrap()).unwrap();
+    assert_eq!(state["root"]["supabaseConfigPath"], config_path);
+    assert_eq!(state["allocations"]["main"]["supabase"]["mode"], "owned");
+    assert_eq!(
+        state["allocations"]["feature-shared"]["supabase"]["mode"],
+        "shared"
+    );
+    assert!(!fs::read_to_string(&log)
+        .unwrap()
+        .contains("supabase db reset"));
+
+    wrt_cmd()
+        .current_dir(managed.path())
+        .env("PATH", &path)
+        .env("MOCK_LOG", &log)
+        .args([
+            "add",
+            "feature/shared-reset",
+            "--install",
+            "false",
+            "--supabase",
+            "shared",
+            "--db",
+            "true",
+        ])
+        .assert()
+        .success();
+    let reset_log = fs::read_to_string(&log).unwrap();
+    assert!(reset_log.contains("supabase db reset"), "{reset_log}");
+    assert!(
+        reset_log
+            .lines()
+            .any(|line| line.contains("supabase db reset") && line.contains("/main/apps/api")),
+        "{reset_log}"
+    );
+    wrt_cmd()
+        .current_dir(managed.path())
+        .env("PATH", &path)
+        .env("MOCK_LOG", &log)
+        .args(["rm", "feature/shared-reset", "--force"])
+        .assert()
+        .success();
+
+    wrt_cmd()
+        .current_dir(managed.path())
+        .env("PATH", &path)
+        .env("MOCK_LOG", &log)
+        .args(["rm", "feature/shared", "--force"])
+        .assert()
+        .success();
+    let shared_log = fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        shared_log.matches("supabase start").count(),
+        1,
+        "{shared_log}"
+    );
+    assert_eq!(
+        shared_log.matches("supabase stop").count(),
+        0,
+        "{shared_log}"
+    );
+
+    wrt_cmd()
+        .current_dir(managed.path())
+        .env("PATH", &path)
+        .env("MOCK_LOG", &log)
+        .args([
+            "add",
+            "feature/conflict",
+            "--install",
+            "false",
+            "--supabase",
+            "shared",
+            "--supabase-config",
+            alternate_config,
+            "--db",
+            "false",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "cannot override the main config in shared mode",
+        ));
+    assert!(!worktree_path(&managed, "feature-conflict").exists());
+
+    wrt_cmd()
+        .current_dir(managed.path())
+        .env("PATH", &path)
+        .env("MOCK_LOG", &log)
+        .args([
+            "add",
+            "feature/isolated",
+            "--install",
+            "false",
+            "--supabase",
+            "isolated",
+            "--supabase-config",
+            alternate_config,
+            "--db",
+            "false",
+        ])
+        .assert()
+        .success();
+
+    let isolated = worktree_path(&managed, "feature-isolated");
+    let isolated_config = fs::read_to_string(isolated.join(alternate_config)).unwrap();
+    assert!(isolated_config.contains("project_id = \"altproj-feature-isolated\""));
+    assert!(isolated_config.contains("port = 55100"));
+    let index = git_out(&isolated, &["ls-files", "-v", alternate_config]);
+    assert!(index.starts_with('S'), "{index}");
+
+    wrt_cmd()
+        .current_dir(managed.path())
+        .env("PATH", &path)
+        .env("MOCK_LOG", &log)
+        .args(["rm", "feature/isolated", "--force"])
+        .assert()
+        .success();
+    let final_log = fs::read_to_string(log).unwrap();
+    assert_eq!(
+        final_log.matches("supabase start").count(),
+        2,
+        "{final_log}"
+    );
+    assert_eq!(final_log.matches("supabase stop").count(), 1, "{final_log}");
+    assert!(
+        final_log.contains("feature-isolated/services/alt"),
+        "{final_log}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn root_init_uses_supabase_path_from_local_wrt_config() {
+    let source = init_repo();
+    let config_path = "apps/api/supabase/config.toml";
+    let config = source.path().join(config_path);
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(&config, "project_id = \"myproj\"\n").unwrap();
+    git(source.path(), &["add", "."]);
+    git(
+        source.path(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-m",
+            "add nested supabase",
+        ],
+    );
+    fs::write(
+        source.path().join(".wrt.json"),
+        format!(r#"{{"supabase":{{"config_path":"{config_path}"}}}}"#),
+    )
+    .unwrap();
+
+    let managed = TempDir::new().unwrap();
+    let bin = TempDir::new().unwrap();
+    let log = source.path().join("supabase.log");
+    write_mock_supabase(bin.path());
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+
+    wrt_cmd()
+        .current_dir(source.path())
+        .env("PATH", path)
+        .env("MOCK_LOG", &log)
+        .args([
+            "root",
+            "init",
+            source.path().to_str().unwrap(),
+            "--root",
+            managed.path().to_str().unwrap(),
+            "--install",
+            "false",
+            "--db",
+            "false",
+        ])
+        .assert()
+        .success();
+
+    let state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(managed.path().join(".git/.wrt/state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["root"]["supabaseConfigPath"], config_path);
+    assert!(fs::read_to_string(log).unwrap().contains("/main/apps/api"));
+}
+
+#[cfg(unix)]
+#[test]
+fn root_init_fails_when_detected_supabase_cannot_start() {
+    let source = init_repo();
+    let sbdir = source.path().join("supabase");
+    fs::create_dir_all(&sbdir).unwrap();
+    fs::write(sbdir.join("config.toml"), "project_id = \"myproj\"\n").unwrap();
+    git(source.path(), &["add", "."]);
+    git(
+        source.path(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-m",
+            "add supabase",
+        ],
+    );
+    let managed = TempDir::new().unwrap();
+
+    let mut cmd = wrt_cmd();
+    cmd.current_dir(source.path()).args([
+        "root",
+        "init",
+        source.path().to_str().unwrap(),
+        "--root",
+        managed.path().to_str().unwrap(),
+        "--install",
+        "false",
+        "--db",
+        "false",
+    ]);
+    set_minimal_path(&mut cmd);
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("supabase CLI not found"));
+
+    let state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(managed.path().join(".git/.wrt/state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["allocations"]["main"]["status"], "failed");
+    assert_eq!(state["allocations"]["main"]["supabase"]["mode"], "owned");
+
+    let bin = TempDir::new().unwrap();
+    let log = managed.path().join("supabase.log");
+    write_mock_supabase(bin.path());
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+    wrt_cmd()
+        .current_dir(managed.path())
+        .env("PATH", path)
+        .env("MOCK_LOG", log)
+        .args([
+            "add",
+            "recovery",
+            "--install",
+            "false",
+            "--supabase",
+            "shared",
+            "--db",
+            "false",
+        ])
+        .assert()
+        .success();
+    let state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(managed.path().join(".git/.wrt/state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["allocations"]["main"]["status"], "failed");
+    assert!(main_path(&managed).join(".env").exists());
+}
+
+#[test]
+fn root_init_rejects_unsafe_supabase_config_path() {
+    let source = init_repo();
+    let managed = TempDir::new().unwrap();
+
+    wrt_cmd()
+        .current_dir(source.path())
+        .args([
+            "root",
+            "init",
+            source.path().to_str().unwrap(),
+            "--root",
+            managed.path().to_str().unwrap(),
+            "--supabase-config",
+            "../supabase/config.toml",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("must stay inside the worktree"));
+    assert!(!managed.path().join(".git").exists());
 }
 
 #[test]

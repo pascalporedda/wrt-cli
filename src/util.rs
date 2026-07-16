@@ -23,6 +23,7 @@ pub fn run_cmd(dir: &Path, cmd: &str, args: &[&str]) -> Result<()> {
 
 pub fn run_argv_with_wrt_env(
     repo: &Repo,
+    state: &State,
     dir: &Path,
     a: &Allocation,
     argv: &[String],
@@ -43,7 +44,7 @@ pub fn run_argv_with_wrt_env(
     for (k, v) in envs {
         c.env(k, v);
     }
-    crate::envx::apply_to_command_env(&mut c, repo, a);
+    crate::envx::apply_to_command_env(&mut c, repo, state, a)?;
 
     let status = c.status().with_context(|| format!("run {cmd}"))?;
     if !status.success() {

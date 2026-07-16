@@ -1,8 +1,7 @@
 use anyhow::Result;
 use std::path::Path;
 
-use crate::state::State;
-use crate::supabase;
+use crate::state::{State, SupabaseAllocation};
 use crate::worktree;
 
 pub fn cmd_ls(st: &State) -> Result<i32> {
@@ -17,10 +16,17 @@ pub fn cmd_ls(st: &State) -> Result<i32> {
             Ok(false) => "clean",
             Err(_) => "?",
         };
-        let supabase = if supabase::has_config(Path::new(&a.path)) {
-            "supabase=patched"
-        } else {
-            "supabase=none"
+        let supabase = match &a.supabase {
+            SupabaseAllocation::Owned { .. } if a.name == "main" => "supabase=owner(main)",
+            SupabaseAllocation::Owned { .. } => "supabase=isolated",
+            SupabaseAllocation::Shared { owner } => {
+                if owner == "main" {
+                    "supabase=shared(main)"
+                } else {
+                    "supabase=shared"
+                }
+            }
+            SupabaseAllocation::None => "supabase=none",
         };
         println!(
             "{:<28}  block={:<3}  offset={:<4}  {:<8}  {:<5}  {:<17}  {}  ({})",

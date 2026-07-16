@@ -168,20 +168,33 @@ pub fn copy_repo_env(repo_root: &Path, wt_path: &Path) -> Result<bool> {
     copy_repo_file(repo_root, wt_path, ".env")
 }
 
+pub fn copy_repo_env_at(repo_root: &Path, wt_path: &Path, relative_dir: &Path) -> Result<bool> {
+    let src = repo_root.join(relative_dir).join(".env");
+    let dst = wt_path.join(relative_dir).join(".env");
+    copy_file(&src, &dst)
+}
+
 pub fn copy_repo_config(repo_root: &Path, wt_path: &Path) -> Result<bool> {
     copy_repo_file(repo_root, wt_path, ".wrt.json")
 }
 
 fn copy_repo_file(repo_root: &Path, wt_path: &Path, file_name: &str) -> Result<bool> {
     let src = repo_root.join(file_name);
+    let dst = wt_path.join(file_name);
+    copy_file(&src, &dst)
+}
+
+fn copy_file(src: &Path, dst: &Path) -> Result<bool> {
     if !src.is_file() {
         return Ok(false);
     }
-    let dst = wt_path.join(file_name);
     if dst.exists() {
         return Ok(false);
     }
-    fs::copy(&src, &dst).with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    fs::copy(src, dst).with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
     Ok(true)
 }
 

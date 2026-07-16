@@ -6,6 +6,8 @@ use crate::cli::DbAction;
 use crate::db;
 use crate::gitx;
 use crate::state::State;
+use crate::state::SupabaseAllocation;
+use crate::supabase;
 use crate::ui;
 use crate::util::{confirm, infer_worktree_from_cwd, run_argv_with_wrt_env};
 use crate::worktree;
@@ -44,7 +46,9 @@ pub fn cmd_db(
         DbAction::Seed { print } => ("seed", false, print),
         DbAction::Migrate { print } => ("migrate", false, print),
     };
-    let (kind_hint, cmd) = db::command(&repo.config_root, &wt_path, op);
+    let resolved_target = supabase::allocation_target(st, a)?;
+    let target = resolved_target.as_ref().map(|(_, target)| target.clone());
+    let (kind_hint, cmd) = db::command(&repo.config_root, &wt_path, target.as_ref(), op);
 
     let Some(argv) = cmd else {
         let label = kind_hint.as_deref().unwrap_or("database");
@@ -59,6 +63,12 @@ pub fn cmd_db(
 
     let label = kind_hint.as_deref().unwrap_or("database");
     let cmd_str = argv.join(" ");
+
+    if let SupabaseAllocation::Shared { owner } = &a.supabase {
+        log.infof(&format!(
+            "{label}: operation targets the shared database owned by {owner}"
+        ));
+    }
 
     if print {
         println!("{cmd_str}");
@@ -82,5 +92,10 @@ pub fn cmd_db(
     }
 
     log.infof(&format!("{label}: running: {cmd_str}"));
-    run_argv_with_wrt_env(repo, &wt_path, a, &argv)
+    let command_dir = if kind_hint.as_deref() == Some("supabase") {
+        supabase::command_workdir(resolved_target.as_ref(), &wt_path)
+    } else {
+        wt_path
+    };
+    run_argv_with_wrt_env(repo, st, &command_dir, a, &argv)
 }

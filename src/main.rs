@@ -63,6 +63,7 @@ fn run() -> Result<i32> {
             main,
             install,
             supabase,
+            supabase_config,
             db,
         } => {
             let opts = CloneOpts {
@@ -70,7 +71,8 @@ fn run() -> Result<i32> {
                 root: root.as_deref(),
                 main: main.as_deref(),
                 install_mode: &install,
-                sb_mode: &supabase,
+                sb_mode: supabase,
+                supabase_config: supabase_config.as_deref(),
                 db_mode: &db,
             };
             return cmd_clone(&log, opts);
@@ -83,6 +85,7 @@ fn run() -> Result<i32> {
                     main,
                     install,
                     supabase,
+                    supabase_config,
                     db,
                 },
         } => {
@@ -91,7 +94,8 @@ fn run() -> Result<i32> {
                 root: &root,
                 main: main.as_deref(),
                 install_mode: &install,
-                sb_mode: &supabase,
+                sb_mode: supabase,
+                supabase_config: supabase_config.as_deref(),
                 db_mode: &db,
             };
             return cmd_root_init(&log, opts);
@@ -110,7 +114,10 @@ fn run() -> Result<i32> {
         }
     };
 
-    let _ = gitx::ensure_info_exclude(&repo.common_dir, &[".wrt.env", ".wrt.json"]);
+    let _ = gitx::ensure_info_exclude(
+        &repo.common_dir,
+        &[".env", ".env.local", ".wrt.env", ".wrt.json"],
+    );
 
     let mut st = match state::State::load(&repo.common_dir) {
         Ok(s) => s,
@@ -148,6 +155,7 @@ fn run() -> Result<i32> {
             branch,
             install,
             supabase,
+            supabase_config,
             db,
             cd,
         } => {
@@ -156,7 +164,8 @@ fn run() -> Result<i32> {
                 from_ref: &from,
                 branch: branch.as_deref(),
                 install_mode: &install,
-                sb_mode: &supabase,
+                sb_mode: supabase,
+                supabase_config: supabase_config.as_deref(),
                 db_mode: &db,
                 emit_cd: cd,
             };
