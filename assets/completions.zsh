@@ -2,8 +2,14 @@
 
 _wrt_worktrees() {
   local -a names
-  names=(${(f)"$(wrt ls 2>/dev/null | awk 'NF && $1 !~ /^\\(/ {print $1}')"})
+  names=(${(f)"$(command wrt ls 2>/dev/null | awk 'NF && $1 != "(no" {print $1}')"})
   _describe -t worktrees 'worktree' names
+}
+
+_wrt_branches() {
+  local -a branches
+  branches=(${(f)"$(command git for-each-ref --format='%(refname) %(symref)' refs/heads refs/remotes 2>/dev/null | awk 'NF == 1 { name = $1; sub("^refs/heads/", "", name); sub("^refs/remotes/[^/]+/", "", name); if (!seen[name]++) print name }')"})
+  _describe -t branches 'branch' branches
 }
 
 _wrt() {
@@ -35,7 +41,7 @@ _wrt() {
       return
       ;;
     args)
-      case $words[2] in
+      case $line[1] in
         rm|remove)
           _arguments -C \
             '1:worktree:_wrt_worktrees' \
@@ -65,7 +71,7 @@ _wrt() {
           ;;
         new|add)
           _arguments -C \
-            '1:name:' \
+            '1:name:_wrt_branches' \
             '--from=[Start ref]:ref:' \
             '--branch=[Branch name]:branch:' \
             '--install=[Install deps]:mode:(auto true false)' \
@@ -94,7 +100,7 @@ _wrt() {
           return
           ;;
         root)
-          case $words[3] in
+          case $line[2] in
             init)
               _arguments -C \
                 '1:source:_files' \

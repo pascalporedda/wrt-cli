@@ -92,6 +92,11 @@ echo 'fpath=(~/.zsh/completions $fpath)\nautoload -Uz compinit && compinit' >> ~
 ```
 Restart your shell or `exec zsh`.
 
+The completion script suggests tracked worktree names for commands such as
+`wrt remove`, and local or fetched remote branch names for `wrt add`/`wrt new`.
+Remote names are shown without their remote prefix (for example,
+`feature/login` instead of `origin/feature/login`).
+
 2. Oh My Zsh plugin
 ```zsh
 mkdir -p ~/.oh-my-zsh/custom/plugins/wrt
@@ -101,6 +106,9 @@ fpath=(${0:A:h} $fpath)
 EOF
 ```
 Add `wrt` to `plugins=(...)` in `~/.zshrc`, then restart your shell.
+When the Oh My Zsh plugin is enabled, regenerate the plugin's `_wrt` file after
+upgrading `wrt`; updating `~/.zsh/completions/_wrt` does not update the active
+plugin copy.
 
 Zsh convenience wrapper (auto-`cd` on `wrt new`):
 
