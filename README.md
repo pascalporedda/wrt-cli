@@ -258,7 +258,7 @@ For isolated stacks:
 
 ## Tech Stack
 
-- Rust (edition 2021)
+- Rust (edition 2024, Rust 1.85+)
 - clap (CLI parsing)
 - serde / serde_json (state + discovery config)
 - toml_edit (Supabase config patching)
