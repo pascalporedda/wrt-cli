@@ -1,9 +1,9 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use toml_edit::{value, DocumentMut, InlineTable, Item, Table, Value};
+use toml_edit::{DocumentMut, InlineTable, Item, Table, Value, value};
 
 use crate::state::{Allocation, State, SupabaseAllocation};
 

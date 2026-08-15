@@ -1,12 +1,12 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 
 use crate::cli::RootSupabaseMode;
-use crate::cmd::new::{setup_existing_worktree, SetupModes};
+use crate::cmd::new::{SetupModes, setup_existing_worktree};
 use crate::gitx;
-use crate::state::{Allocation, RootState, State, SupabaseAllocation, LAYOUT_MANAGED_ROOT};
+use crate::state::{Allocation, LAYOUT_MANAGED_ROOT, RootState, State, SupabaseAllocation};
 use crate::supabase;
 use crate::ui;
 use crate::util::run_cmd;

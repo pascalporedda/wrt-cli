@@ -897,12 +897,16 @@ fn nested_supabase_config_supports_shared_and_isolated_features() {
     let shared_config = fs::read_to_string(shared.join(config_path)).unwrap();
     assert!(shared_config.contains("project_id = \"myproj\""));
     assert!(!shared_config.contains("myproj-feature-shared"));
-    assert!(fs::read_to_string(shared.join(".wrt.env"))
-        .unwrap()
-        .contains("WRT_SUPABASE_OWNER='main'"));
-    assert!(fs::read_to_string(shared.join("apps/api/.env"))
-        .unwrap()
-        .contains("CUSTOM_NESTED=value"));
+    assert!(
+        fs::read_to_string(shared.join(".wrt.env"))
+            .unwrap()
+            .contains("WRT_SUPABASE_OWNER='main'")
+    );
+    assert!(
+        fs::read_to_string(shared.join("apps/api/.env"))
+            .unwrap()
+            .contains("CUSTOM_NESTED=value")
+    );
     let state_path = managed.path().join(".git/.wrt/state.json");
     let state: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&state_path).unwrap()).unwrap();
@@ -912,9 +916,11 @@ fn nested_supabase_config_supports_shared_and_isolated_features() {
         state["allocations"]["feature-shared"]["supabase"]["mode"],
         "shared"
     );
-    assert!(!fs::read_to_string(&log)
-        .unwrap()
-        .contains("supabase db reset"));
+    assert!(
+        !fs::read_to_string(&log)
+            .unwrap()
+            .contains("supabase db reset")
+    );
 
     wrt_cmd()
         .current_dir(managed.path())
@@ -1467,12 +1473,16 @@ fn new_replaces_untracked_local_branch_with_remote_branch() {
         &["rev-parse", "--abbrev-ref", "feature/existing@{upstream}"],
     );
     assert_eq!(upstream.trim(), "origin/feature/existing");
-    assert!(worktree_path(&td, "feature-existing")
-        .join("FEATURE.txt")
-        .exists());
-    assert!(!worktree_path(&td, "feature-existing")
-        .join("STALE.txt")
-        .exists());
+    assert!(
+        worktree_path(&td, "feature-existing")
+            .join("FEATURE.txt")
+            .exists()
+    );
+    assert!(
+        !worktree_path(&td, "feature-existing")
+            .join("STALE.txt")
+            .exists()
+    );
     assert_eq!(
         git_out(&main_path, &["rev-parse", "feature/existing"]),
         git_out(&main_path, &["rev-parse", "origin/feature/existing"])

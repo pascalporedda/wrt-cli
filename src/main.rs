@@ -19,9 +19,9 @@ mod worktree;
 
 use cli::{Cli, Cmd, RootAction, USAGE_TEXT};
 use cmd::{
-    cmd_clone, cmd_db, cmd_env, cmd_housekeeping, cmd_init, cmd_ls, cmd_new, cmd_path, cmd_prune,
-    cmd_rm, cmd_root_init, cmd_root_status, cmd_run, raw_run_has_sep, CloneOpts, NewOpts,
-    RootInitOpts,
+    CloneOpts, NewOpts, RootInitOpts, cmd_clone, cmd_db, cmd_env, cmd_housekeeping, cmd_init,
+    cmd_ls, cmd_new, cmd_path, cmd_prune, cmd_rm, cmd_root_init, cmd_root_status, cmd_run,
+    raw_run_has_sep,
 };
 
 fn main() -> ExitCode {
