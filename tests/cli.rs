@@ -184,7 +184,7 @@ fn write_mock_supabase(dir: &Path) {
         dir,
         "supabase",
         r#"#!/bin/sh
-printf 'supabase %s [%s]\n' "$*" "$PWD" >> "$MOCK_LOG"
+printf 'supabase %s [%s] branch=%s\n' "$*" "$PWD" "$GITHUB_HEAD_REF" >> "$MOCK_LOG"
 case "$1" in
   status)
     test -f .mock_supabase_started || exit 1
@@ -353,7 +353,9 @@ fn new_patches_supabase_and_sets_skip_worktree_when_isolated() {
         "project_id = \"myproj\"\nport = 5432\nauth_site_url = \"http://localhost:3000\"\n",
     )
     .unwrap();
-    git(source.path(), &["add", "supabase/config.toml"]);
+    fs::create_dir_all(sbdir.join("migrations")).unwrap();
+    fs::write(sbdir.join("migrations/001_init.sql"), "select 1;\n").unwrap();
+    git(source.path(), &["add", "supabase"]);
     git(
         source.path(),
         &[
@@ -376,7 +378,16 @@ fn new_patches_supabase_and_sets_skip_worktree_when_isolated() {
     cmd.current_dir(td.path())
         .env("PATH", path)
         .env("MOCK_LOG", log)
-        .args(["new", "x", "--install", "false", "--supabase", "isolated"]);
+        .args([
+            "new",
+            "x",
+            "--install",
+            "false",
+            "--supabase",
+            "isolated",
+            "--db",
+            "true",
+        ]);
     cmd.assert().success();
 
     let wt_dir = worktree_path(&td, "x");
@@ -390,6 +401,13 @@ fn new_patches_supabase_and_sets_skip_worktree_when_isolated() {
     // Ensure skip-worktree is set.
     let v = git_out(&wt_dir, &["ls-files", "-v", "supabase/config.toml"]);
     assert!(v.starts_with('S'));
+
+    let log = fs::read_to_string(td.path().join("supabase.log")).unwrap();
+    assert!(
+        log.lines()
+            .any(|line| line.contains("supabase db reset") && line.contains("branch=x")),
+        "{log}"
+    );
 }
 
 #[test]
@@ -919,7 +937,9 @@ fn nested_supabase_config_supports_shared_and_isolated_features() {
     assert!(
         reset_log
             .lines()
-            .any(|line| line.contains("supabase db reset") && line.contains("/main/apps/api")),
+            .any(|line| line.contains("supabase db reset")
+                && line.contains("/main/apps/api")
+                && line.contains("branch=main")),
         "{reset_log}"
     );
     wrt_cmd()

@@ -45,6 +45,19 @@ pub fn run_argv_with_wrt_env(
         c.env(k, v);
     }
     crate::envx::apply_to_command_env(&mut c, repo, state, a)?;
+    if Path::new(cmd).file_name().and_then(|name| name.to_str()) == Some("supabase") {
+        // Supabase CLI reads `.git/HEAD` to label local database commands. Linked Git
+        // worktrees use a `.git` file, so its fallback can report the managed root's branch.
+        // GITHUB_HEAD_REF is Supabase's first-choice branch signal.
+        let branch = state
+            .allocations
+            .values()
+            .filter(|allocation| dir.starts_with(Path::new(&allocation.path)))
+            .max_by_key(|allocation| Path::new(&allocation.path).components().count())
+            .map(|allocation| allocation.branch.as_str())
+            .unwrap_or(&a.branch);
+        c.env("GITHUB_HEAD_REF", branch);
+    }
 
     let status = c.status().with_context(|| format!("run {cmd}"))?;
     if !status.success() {
