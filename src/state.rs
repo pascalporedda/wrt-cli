@@ -122,6 +122,32 @@ impl State {
     pub fn sorted_allocations(&self) -> Vec<Allocation> {
         self.allocations.values().cloned().collect()
     }
+
+    pub fn primary_allocation(&self) -> Option<(&str, &Allocation)> {
+        let by_path = self.root.as_ref().and_then(|root| {
+            let primary_path = Path::new(&root.main_worktree);
+            self.allocations
+                .iter()
+                .find(|(_, allocation)| Path::new(&allocation.path) == primary_path)
+        });
+
+        by_path
+            .or_else(|| {
+                self.allocations
+                    .iter()
+                    .find(|(_, allocation)| allocation.block == 0)
+            })
+            .map(|(key, allocation)| (key.as_str(), allocation))
+    }
+
+    pub fn primary_allocation_key(&self) -> Option<&str> {
+        self.primary_allocation().map(|(key, _)| key)
+    }
+
+    pub fn is_primary_allocation(&self, allocation: &Allocation) -> bool {
+        self.primary_allocation()
+            .is_some_and(|(_, primary)| primary.path == allocation.path)
+    }
 }
 
 fn file_path(git_common_dir: &Path) -> PathBuf {
@@ -178,5 +204,49 @@ mod tests {
 
         let error = State::load(td.path()).unwrap_err().to_string();
         assert!(error.contains("unsupported wrt state version"), "{error}");
+    }
+
+    #[test]
+    fn primary_allocation_follows_managed_root_path_instead_of_main_key() {
+        let mut state = State::empty();
+        state.root = Some(RootState {
+            layout: LAYOUT_MANAGED_ROOT.to_string(),
+            managed_root: "/repo".to_string(),
+            git_common_dir: "/repo/.git".to_string(),
+            main_worktree: "/repo/staging".to_string(),
+            worktrees_path: "/repo".to_string(),
+            created_at: "now".to_string(),
+            supabase_config_path: None,
+        });
+        state.allocations.insert(
+            "main".to_string(),
+            Allocation {
+                name: "main".to_string(),
+                branch: "main".to_string(),
+                path: "/repo/main".to_string(),
+                block: 2,
+                offset: 200,
+                status: "active".to_string(),
+                created_at: "later".to_string(),
+                supabase: SupabaseAllocation::None,
+            },
+        );
+        state.allocations.insert(
+            "staging".to_string(),
+            Allocation {
+                name: "staging".to_string(),
+                branch: "staging".to_string(),
+                path: "/repo/staging".to_string(),
+                block: 0,
+                offset: 0,
+                status: "active".to_string(),
+                created_at: "now".to_string(),
+                supabase: SupabaseAllocation::None,
+            },
+        );
+
+        assert_eq!(state.primary_allocation_key(), Some("staging"));
+        assert!(state.is_primary_allocation(&state.allocations["staging"]));
+        assert!(!state.is_primary_allocation(&state.allocations["main"]));
     }
 }

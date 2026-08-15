@@ -176,7 +176,7 @@ pub fn setup_existing_worktree(
     }
     if let SupabaseAllocation::Owned { config_path, .. } = &allocation.supabase {
         let target = supabase::Target::from_config_path(config_path)?;
-        if allocation.name != "main" {
+        if !state.is_primary_allocation(&allocation) {
             log.infof("supabase detected: patching config for isolation (project_id + ports)");
             if let Err(e) =
                 supabase::patch_config(wt_path, &target, &allocation.name, allocation.offset)
@@ -221,12 +221,12 @@ pub fn setup_existing_worktree(
             "supabase: ensuring {} stack is running",
             owner.name
         ));
-        let owner_name = owner.name.clone();
+        let owner = owner.clone();
+        let owner_is_primary = state.is_primary_allocation(&owner);
         let owner_path = owner.path.clone();
         supabase::ensure_started(Path::new(&owner_path), &target)?;
-        if owner_name == "main" && allocation_name != "main" {
-            let main = state.allocations["main"].clone();
-            envx::sync_env_files(repo, state, Path::new(&owner_path), &main)?;
+        if owner_is_primary && owner.path != allocation.path {
+            envx::sync_env_files(repo, state, Path::new(&owner_path), &owner)?;
         }
     }
 
@@ -361,8 +361,11 @@ fn resolve_feature_supabase(
                     );
                 }
             }
+            let owner = state
+                .primary_allocation_key()
+                .ok_or_else(|| anyhow::anyhow!("primary worktree allocation is missing"))?;
             Ok(SupabaseAllocation::Shared {
-                owner: "main".to_string(),
+                owner: owner.to_string(),
             })
         }
         ResolvedSupabaseMode::Isolated => {
@@ -392,10 +395,11 @@ fn ensure_main_supabase(
     state: &mut State,
     allow_disabled: bool,
 ) -> Result<bool> {
-    let Some(main) = state.allocations.get("main").cloned() else {
+    let Some(primary_key) = state.primary_allocation_key().map(str::to_string) else {
         return Ok(false);
     };
-    match main.supabase {
+    let primary = state.allocations[&primary_key].clone();
+    match primary.supabase {
         SupabaseAllocation::Owned { .. } => return Ok(true),
         SupabaseAllocation::None if !allow_disabled => return Ok(false),
         SupabaseAllocation::Shared { .. } => {
@@ -408,7 +412,7 @@ fn ensure_main_supabase(
         .root
         .as_ref()
         .and_then(|root| root.supabase_config_path.as_deref());
-    let main_path = Path::new(&main.path);
+    let main_path = Path::new(&primary.path);
     let discovery_root = if repo.config_root.join(".wrt.json").is_file() {
         repo.config_root.as_path()
     } else {
@@ -422,8 +426,8 @@ fn ensure_main_supabase(
     if let Some(root) = state.root.as_mut() {
         root.supabase_config_path = Some(target.config_path_string());
     }
-    if let Some(main) = state.allocations.get_mut("main") {
-        main.supabase = SupabaseAllocation::Owned {
+    if let Some(primary) = state.allocations.get_mut(&primary_key) {
+        primary.supabase = SupabaseAllocation::Owned {
             project_id,
             config_path: target.config_path_string(),
         };
@@ -431,7 +435,7 @@ fn ensure_main_supabase(
     state.save(&repo.common_dir)?;
     log.infof("supabase: establishing shared main stack");
     supabase::ensure_started(main_path, &target)?;
-    let main = state.allocations["main"].clone();
-    envx::sync_env_files(repo, state, main_path, &main)?;
+    let primary = state.allocations[&primary_key].clone();
+    envx::sync_env_files(repo, state, main_path, &primary)?;
     Ok(true)
 }

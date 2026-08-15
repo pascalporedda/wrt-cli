@@ -100,10 +100,14 @@ pub fn allocation_target<'a>(
             Ok(Some((allocation, Target::from_config_path(config_path)?)))
         }
         SupabaseAllocation::Shared { owner } => {
-            let owner = state
-                .allocations
-                .get(owner)
-                .ok_or_else(|| anyhow!("supabase owner worktree is missing: {owner}"))?;
+            // Older state always used "main" as a logical primary-owner marker, even when the
+            // managed root's primary checkout had another name such as "staging".
+            let owner = if owner == "main" {
+                state.primary_allocation().map(|(_, allocation)| allocation)
+            } else {
+                state.allocations.get(owner)
+            }
+            .ok_or_else(|| anyhow!("supabase owner worktree is missing: {owner}"))?;
             let SupabaseAllocation::Owned { config_path, .. } = &owner.supabase else {
                 return Err(anyhow!(
                     "supabase owner {} does not own a running stack",

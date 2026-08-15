@@ -17,14 +17,14 @@ pub fn cmd_rm(
     delete_branch: bool,
 ) -> Result<i32> {
     let key = worktree::slug(name);
-    if key == "main" {
-        log.errorf("the main worktree cannot be removed");
-        return Ok(2);
-    }
     let Some(a) = st.allocations.get(&key).cloned() else {
         log.errorf(&format!("unknown worktree: \"{key}\""));
         return Ok(2);
     };
+    if st.is_primary_allocation(&a) {
+        log.errorf("the main worktree cannot be removed");
+        return Ok(2);
+    }
 
     log.infof(&format!("removing worktree: {} ({})", a.name, a.path));
 

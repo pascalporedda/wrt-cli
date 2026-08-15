@@ -176,7 +176,7 @@ pub fn cmd_root_init(log: &ui::Logger, opts: RootInitOpts<'_>) -> Result<i32> {
         };
 
     let alloc = Allocation {
-        name: "main".to_string(),
+        name: worktree::slug(&branch),
         branch: branch.clone(),
         path: main_path.to_string_lossy().to_string(),
         block: 0,
@@ -197,12 +197,13 @@ pub fn cmd_root_init(log: &ui::Logger, opts: RootInitOpts<'_>) -> Result<i32> {
         supabase_config_path: (opts.supabase_config.is_some() || has_supabase)
             .then(|| target.config_path_string()),
     });
-    st.allocations.insert("main".to_string(), alloc.clone());
+    let primary_key = alloc.name.clone();
+    st.allocations.insert(primary_key.clone(), alloc.clone());
     st.save(&git_dir)?;
     let _ = gitx::ensure_info_exclude(&git_dir, &[".env", ".env.local", ".wrt.env", ".wrt.json"]);
 
     if let Some(error) = setup_failure {
-        if let Some(a) = st.allocations.get_mut("main") {
+        if let Some(a) = st.allocations.get_mut(&primary_key) {
             a.status = "failed".to_string();
         }
         st.save(&git_dir)?;
@@ -222,8 +223,8 @@ pub fn cmd_root_init(log: &ui::Logger, opts: RootInitOpts<'_>) -> Result<i32> {
         db_mode: opts.db_mode,
     };
 
-    if let Err(e) = setup_existing_worktree(log, &repo, &mut st, "main", &main_path, modes) {
-        if let Some(a) = st.allocations.get_mut("main") {
+    if let Err(e) = setup_existing_worktree(log, &repo, &mut st, &primary_key, &main_path, modes) {
+        if let Some(a) = st.allocations.get_mut(&primary_key) {
             a.status = "failed".to_string();
         }
         let _ = st.save(&git_dir);
@@ -231,7 +232,7 @@ pub fn cmd_root_init(log: &ui::Logger, opts: RootInitOpts<'_>) -> Result<i32> {
         return Ok(1);
     }
 
-    if let Some(a) = st.allocations.get_mut("main") {
+    if let Some(a) = st.allocations.get_mut(&primary_key) {
         a.status = "active".to_string();
     }
     st.save(&git_dir)?;
@@ -263,8 +264,8 @@ pub fn cmd_root_status(log: &ui::Logger, repo: &gitx::Repo, st: &State) -> Resul
     println!("tracked worktrees: {}", st.allocations.len());
 
     let supabase_status = st
-        .allocations
-        .get("main")
+        .primary_allocation()
+        .map(|(_, allocation)| allocation)
         .map(|allocation| match &allocation.supabase {
             SupabaseAllocation::Owned { .. } => "shared main",
             SupabaseAllocation::None => "none",

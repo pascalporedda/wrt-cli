@@ -573,6 +573,141 @@ fn clone_names_primary_worktree_after_default_branch() {
         .success()
         .stdout(predicate::str::is_match(r"main worktree: .*/staging\n").unwrap())
         .stdout(predicate::str::contains("tracked worktrees: 1"));
+
+    wrt_cmd()
+        .current_dir(&managed)
+        .arg("ls")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("staging"));
+}
+
+#[cfg(unix)]
+#[test]
+fn non_main_primary_owns_supabase_even_when_feature_is_named_main() {
+    let source = init_repo_on_branch("staging");
+    let supabase_dir = source.path().join("supabase");
+    fs::create_dir_all(&supabase_dir).unwrap();
+    fs::write(
+        supabase_dir.join("config.toml"),
+        "project_id = \"staging-project\"\n",
+    )
+    .unwrap();
+    git(source.path(), &["add", "supabase/config.toml"]);
+    git(
+        source.path(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-m",
+            "add supabase",
+        ],
+    );
+
+    let managed = TempDir::new().unwrap();
+    let bin = TempDir::new().unwrap();
+    let log = managed.path().join("supabase.log");
+    write_mock_supabase(bin.path());
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+
+    wrt_cmd()
+        .current_dir(source.path())
+        .env("PATH", &path)
+        .env("MOCK_LOG", &log)
+        .args([
+            "root",
+            "init",
+            source.path().to_str().unwrap(),
+            "--root",
+            managed.path().to_str().unwrap(),
+            "--install",
+            "false",
+            "--db",
+            "false",
+        ])
+        .assert()
+        .success();
+
+    wrt_cmd()
+        .current_dir(managed.path())
+        .env("PATH", &path)
+        .env("MOCK_LOG", &log)
+        .args([
+            "add",
+            "main",
+            "--install",
+            "false",
+            "--supabase",
+            "none",
+            "--db",
+            "false",
+        ])
+        .assert()
+        .success();
+
+    wrt_cmd()
+        .current_dir(managed.path())
+        .args(["root", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("supabase config: shared main"));
+
+    wrt_cmd()
+        .current_dir(managed.path())
+        .env("PATH", &path)
+        .env("MOCK_LOG", &log)
+        .args([
+            "add",
+            "feature/shared",
+            "--install",
+            "false",
+            "--db",
+            "false",
+        ])
+        .assert()
+        .success();
+
+    let state_path = managed.path().join(".git/.wrt/state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&state_path).unwrap()).unwrap();
+    assert_eq!(state["allocations"]["staging"]["supabase"]["mode"], "owned");
+    assert_eq!(state["allocations"]["main"]["supabase"]["mode"], "none");
+    assert_eq!(
+        state["allocations"]["feature-shared"]["supabase"]["owner"],
+        "staging"
+    );
+
+    // Compatibility with state written before primary owners used their actual allocation key.
+    state["allocations"]["feature-shared"]["supabase"]["owner"] =
+        serde_json::Value::String("main".to_string());
+    fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+    wrt_cmd()
+        .current_dir(managed.path())
+        .env("PATH", &path)
+        .env("MOCK_LOG", &log)
+        .args(["env", "feature/shared"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("WRT_SUPABASE_OWNER='staging'"));
+
+    wrt_cmd()
+        .current_dir(managed.path())
+        .args(["rm", "staging"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "the main worktree cannot be removed",
+        ));
+
+    wrt_cmd()
+        .current_dir(managed.path())
+        .args(["rm", "main", "--force"])
+        .assert()
+        .success();
+    assert!(!managed.path().join("main").exists());
 }
 
 #[cfg(unix)]

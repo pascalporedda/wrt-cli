@@ -17,10 +17,12 @@ pub fn cmd_ls(st: &State) -> Result<i32> {
             Err(_) => "?",
         };
         let supabase = match &a.supabase {
-            SupabaseAllocation::Owned { .. } if a.name == "main" => "supabase=owner(main)",
+            SupabaseAllocation::Owned { .. } if st.is_primary_allocation(&a) => {
+                "supabase=owner(main)"
+            }
             SupabaseAllocation::Owned { .. } => "supabase=isolated",
             SupabaseAllocation::Shared { owner } => {
-                if owner == "main" {
+                if owner == "main" || st.primary_allocation_key() == Some(owner.as_str()) {
                     "supabase=shared(main)"
                 } else {
                     "supabase=shared"
