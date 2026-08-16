@@ -1741,6 +1741,97 @@ fn rm_delete_branch_removes_branch_ref() {
 }
 
 #[test]
+fn rm_delete_branch_removes_configured_remote_branch() {
+    let (_source, td) = init_managed_repo();
+    let main = main_path(&td);
+    let origin = TempDir::new().unwrap();
+    git(origin.path(), &["init", "--bare"]);
+    set_origin_with_remote_tracking(&main, origin.path());
+    git(&main, &["push", "-u", "origin", "main"]);
+
+    wrt_cmd()
+        .current_dir(td.path())
+        .args(["new", "x", "--install", "false", "--supabase", "false"])
+        .assert()
+        .success();
+
+    let wt_dir = worktree_path(&td, "x");
+    git(&wt_dir, &["push", "-u", "origin", "x"]);
+
+    wrt_cmd()
+        .current_dir(td.path())
+        .args(["rm", "x", "--force", "--delete-branch"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("deleting remote branch: origin/x"));
+
+    let local_status = StdCommand::new("git")
+        .args(["show-ref", "--verify", "--quiet", "refs/heads/x"])
+        .current_dir(&main)
+        .status()
+        .unwrap();
+    assert!(!local_status.success());
+
+    let remote_status = StdCommand::new("git")
+        .args([
+            "ls-remote",
+            "--exit-code",
+            "--heads",
+            "origin",
+            "refs/heads/x",
+        ])
+        .current_dir(&main)
+        .status()
+        .unwrap();
+    assert!(!remote_status.success());
+}
+
+#[test]
+fn rm_non_interactive_keeps_local_and_remote_branches_by_default() {
+    let (_source, td) = init_managed_repo();
+    let main = main_path(&td);
+    let origin = TempDir::new().unwrap();
+    git(origin.path(), &["init", "--bare"]);
+    set_origin_with_remote_tracking(&main, origin.path());
+    git(&main, &["push", "-u", "origin", "main"]);
+
+    wrt_cmd()
+        .current_dir(td.path())
+        .args(["new", "x", "--install", "false", "--supabase", "false"])
+        .assert()
+        .success();
+
+    let wt_dir = worktree_path(&td, "x");
+    git(&wt_dir, &["push", "-u", "origin", "x"]);
+
+    wrt_cmd()
+        .current_dir(td.path())
+        .args(["rm", "x", "--force"])
+        .assert()
+        .success();
+
+    let local_status = StdCommand::new("git")
+        .args(["show-ref", "--verify", "--quiet", "refs/heads/x"])
+        .current_dir(&main)
+        .status()
+        .unwrap();
+    assert!(local_status.success());
+
+    let remote_status = StdCommand::new("git")
+        .args([
+            "ls-remote",
+            "--exit-code",
+            "--heads",
+            "origin",
+            "refs/heads/x",
+        ])
+        .current_dir(&main)
+        .status()
+        .unwrap();
+    assert!(remote_status.success());
+}
+
+#[test]
 fn env_infers_from_cwd() {
     let (_source, td) = init_managed_repo();
 

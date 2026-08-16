@@ -1,11 +1,12 @@
 use anyhow::Result;
+use std::io::IsTerminal;
 use std::path::Path;
 
 use crate::gitx;
 use crate::state::{State, SupabaseAllocation};
 use crate::supabase;
 use crate::ui;
-use crate::util::which;
+use crate::util::{confirm, which};
 use crate::worktree;
 
 pub fn cmd_rm(
@@ -25,6 +26,15 @@ pub fn cmd_rm(
         log.errorf("the main worktree cannot be removed");
         return Ok(2);
     }
+
+    let interactive = std::io::stdin().is_terminal();
+    let upstream = if delete_branch || interactive {
+        worktree::branch_upstream(&repo.common_dir, &a.branch)?
+    } else {
+        None
+    };
+    let delete_branch = delete_branch
+        || (interactive && confirm(&branch_delete_prompt(&a.branch, upstream.as_ref()))?);
 
     log.infof(&format!("removing worktree: {} ({})", a.name, a.path));
 
@@ -64,11 +74,27 @@ pub fn cmd_rm(
         return Ok(1);
     }
 
+    let mut branch_cleanup_failed = false;
     if delete_branch {
-        log.infof(&format!("deleting branch: {}", a.branch));
-        if let Err(e) = worktree::delete_branch(&repo.common_dir, &a.branch) {
-            log.errorf(&format!("branch delete failed: {e}"));
-            return Ok(1);
+        if let Some(upstream) = &upstream {
+            log.infof(&format!(
+                "deleting remote branch: {}/{}",
+                upstream.remote, upstream.branch
+            ));
+            if let Err(e) =
+                worktree::delete_remote_branch(&repo.common_dir, &upstream.remote, &upstream.branch)
+            {
+                log.errorf(&format!("remote branch delete failed: {e}"));
+                branch_cleanup_failed = true;
+            }
+        }
+
+        if !branch_cleanup_failed {
+            log.infof(&format!("deleting branch: {}", a.branch));
+            if let Err(e) = worktree::delete_branch(&repo.common_dir, &a.branch) {
+                log.errorf(&format!("branch delete failed: {e}"));
+                branch_cleanup_failed = true;
+            }
         }
     }
 
@@ -83,5 +109,15 @@ pub fn cmd_rm(
         return Ok(1);
     }
 
-    Ok(0)
+    Ok(i32::from(branch_cleanup_failed))
+}
+
+fn branch_delete_prompt(branch: &str, upstream: Option<&worktree::UpstreamBranch>) -> String {
+    match upstream {
+        Some(upstream) => format!(
+            "Also delete local branch {branch} and remote branch {}/{}? (y/N): ",
+            upstream.remote, upstream.branch
+        ),
+        None => format!("Also delete local branch {branch}? (y/N): "),
+    }
 }

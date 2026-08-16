@@ -152,6 +152,42 @@ pub fn delete_branch(git_dir: &Path, branch: &str) -> Result<()> {
     run_git(git_dir, ["branch", "-D", branch])
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpstreamBranch {
+    pub remote: String,
+    pub branch: String,
+}
+
+pub fn branch_upstream(git_dir: &Path, branch: &str) -> Result<Option<UpstreamBranch>> {
+    let local_ref = format!("refs/heads/{branch}");
+    let out = git_out(
+        git_dir,
+        [
+            "for-each-ref",
+            "--format=%(upstream:remotename)%00%(upstream:remoteref)",
+            local_ref.as_str(),
+        ],
+    )?;
+    let Some((remote, remote_ref)) = out.trim().split_once('\0') else {
+        return Ok(None);
+    };
+    let Some(remote_branch) = remote_ref.strip_prefix("refs/heads/") else {
+        return Ok(None);
+    };
+    if remote.is_empty() || remote == "." || remote_branch.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(UpstreamBranch {
+        remote: remote.to_string(),
+        branch: remote_branch.to_string(),
+    }))
+}
+
+pub fn delete_remote_branch(git_dir: &Path, remote: &str, remote_branch: &str) -> Result<()> {
+    run_git(git_dir, ["push", remote, "--delete", remote_branch])
+}
+
 pub fn is_dirty(wt_path: &Path) -> Result<bool> {
     let out = Command::new("git")
         .args(["status", "--porcelain"])

@@ -184,9 +184,10 @@ wrt new docs-only --supabase none
 # persist a nested Supabase project path for main and future worktrees
 wrt clone git@github.com:org/monorepo.git --supabase-config apps/api/supabase/config.toml
 
-# remove worktree (and optionally the branch ref)
+# remove a worktree; interactive runs ask whether to delete its branch
 wrt rm x --force
 wrt remove x --force
+# skip the prompt and delete the local branch plus its configured upstream
 wrt rm x --force --delete-branch
 
 # prune stale state entries after manual deletions
@@ -195,6 +196,9 @@ wrt prune
 # dry-run branch cleanup; add --apply to delete candidates
 wrt housekeeping
 ```
+
+Interactive `wrt rm`/`wrt remove` runs default to keeping the local and upstream
+branches. Pass `--delete-branch` to confirm branch cleanup non-interactively.
 
 ---
 

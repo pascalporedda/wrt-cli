@@ -140,6 +140,7 @@ pub enum Cmd {
         name: String,
         #[arg(long)]
         force: bool,
+        /// Delete the local branch and its configured upstream without prompting
         #[arg(long = "delete-branch")]
         delete_branch: bool,
     },
