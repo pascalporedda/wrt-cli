@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 pub fn slug(s: &str) -> String {
@@ -146,6 +146,43 @@ pub fn remove(git_dir: &Path, wt_path: &Path, force: bool) -> Result<()> {
     }
     args.push(wt_path.to_string_lossy().to_string());
     run_git(git_dir, args)
+}
+
+pub fn is_registered(git_dir: &Path, wt_path: &Path) -> Result<bool> {
+    let out = git_out(git_dir, ["worktree", "list", "--porcelain", "-z"])?;
+    let wt_path = comparable_path(wt_path);
+    Ok(out.split('\0').any(|field| {
+        field
+            .strip_prefix("worktree ")
+            .is_some_and(|path| comparable_path(Path::new(path)) == wt_path)
+    }))
+}
+
+fn comparable_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| {
+        path.parent()
+            .and_then(|parent| fs::canonicalize(parent).ok())
+            .and_then(|parent| path.file_name().map(|name| parent.join(name)))
+            .unwrap_or_else(|| path.to_path_buf())
+    })
+}
+
+pub fn remove_residual_path(wt_path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(wt_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect {}", wt_path.display()));
+        }
+    };
+
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(wt_path)
+            .with_context(|| format!("remove leftover directory {}", wt_path.display()))
+    } else {
+        fs::remove_file(wt_path)
+            .with_context(|| format!("remove leftover path {}", wt_path.display()))
+    }
 }
 
 pub fn delete_branch(git_dir: &Path, branch: &str) -> Result<()> {

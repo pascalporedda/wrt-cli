@@ -1787,6 +1787,60 @@ fn rm_delete_branch_removes_configured_remote_branch() {
 }
 
 #[test]
+fn rm_recovers_after_git_already_deregistered_worktree() {
+    let (_source, td) = init_managed_repo();
+    let main = main_path(&td);
+    let origin = TempDir::new().unwrap();
+    git(origin.path(), &["init", "--bare"]);
+    set_origin_with_remote_tracking(&main, origin.path());
+    git(&main, &["push", "-u", "origin", "main"]);
+
+    wrt_cmd()
+        .current_dir(td.path())
+        .args(["new", "x", "--install", "false", "--supabase", "false"])
+        .assert()
+        .success();
+
+    let wt_dir = worktree_path(&td, "x");
+    git(&wt_dir, &["push", "-u", "origin", "x"]);
+
+    git(&main, &["worktree", "remove", wt_dir.to_str().unwrap()]);
+    fs::create_dir_all(&wt_dir).unwrap();
+    fs::write(wt_dir.join("leftover.txt"), "leftover\n").unwrap();
+
+    wrt_cmd()
+        .current_dir(td.path())
+        .args(["rm", "x", "--delete-branch"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "worktree is already deregistered; continuing cleanup",
+        ));
+
+    assert!(!wt_dir.exists());
+
+    let local_status = StdCommand::new("git")
+        .args(["show-ref", "--verify", "--quiet", "refs/heads/x"])
+        .current_dir(&main)
+        .status()
+        .unwrap();
+    assert!(!local_status.success());
+
+    let remote_status = StdCommand::new("git")
+        .args([
+            "ls-remote",
+            "--exit-code",
+            "--heads",
+            "origin",
+            "refs/heads/x",
+        ])
+        .current_dir(&main)
+        .status()
+        .unwrap();
+    assert!(!remote_status.success());
+}
+
+#[test]
 fn rm_non_interactive_keeps_local_and_remote_branches_by_default() {
     let (_source, td) = init_managed_repo();
     let main = main_path(&td);

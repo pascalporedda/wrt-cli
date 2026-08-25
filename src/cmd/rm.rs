@@ -69,9 +69,30 @@ pub fn cmd_rm(
         }
     }
 
-    if let Err(e) = worktree::remove(&repo.common_dir, wt_path, force) {
-        log.errorf(&format!("git worktree remove failed: {e}"));
-        return Ok(1);
+    if worktree::is_registered(&repo.common_dir, wt_path)? {
+        if let Err(e) = worktree::remove(&repo.common_dir, wt_path, force) {
+            if worktree::is_registered(&repo.common_dir, wt_path)? {
+                log.errorf(&format!("git worktree remove failed: {e}"));
+                return Ok(1);
+            }
+            log.infof(&format!(
+                "git reported a removal error after deregistering the worktree; continuing cleanup: {e}"
+            ));
+        }
+    } else {
+        log.infof("worktree is already deregistered; continuing cleanup");
+    }
+
+    let mut worktree_cleanup_failed = false;
+    if wt_path.symlink_metadata().is_ok() {
+        log.infof(&format!(
+            "removing leftover worktree path: {}",
+            wt_path.display()
+        ));
+        if let Err(e) = worktree::remove_residual_path(wt_path) {
+            log.errorf(&format!("leftover worktree path removal failed: {e}"));
+            worktree_cleanup_failed = true;
+        }
     }
 
     let mut branch_cleanup_failed = false;
@@ -109,7 +130,7 @@ pub fn cmd_rm(
         return Ok(1);
     }
 
-    Ok(i32::from(branch_cleanup_failed))
+    Ok(i32::from(worktree_cleanup_failed || branch_cleanup_failed))
 }
 
 fn branch_delete_prompt(branch: &str, upstream: Option<&worktree::UpstreamBranch>) -> String {
