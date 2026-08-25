@@ -1,11 +1,12 @@
-use anyhow::{Context, Result};
-use std::collections::BTreeMap;
+use anyhow::{Context, Result, bail};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use crate::codex;
 use crate::gitx::Repo;
+use crate::project::ProjectConfig;
 use crate::state::{Allocation, State};
 use crate::supabase;
 use crate::util::sh_quote;
@@ -14,57 +15,177 @@ use crate::worktree;
 const SUPABASE_BLOCK_START: &str = "# >>> wrt supabase (generated)";
 const SUPABASE_BLOCK_END: &str = "# <<< wrt supabase";
 
-pub fn vars(repo: &Repo, state: &State, alloc: &Allocation) -> Result<BTreeMap<String, String>> {
-    let wt_path = Path::new(&alloc.path);
-    let mut vars = BTreeMap::new();
+#[derive(Clone, Debug, Default)]
+pub struct ResolvedEnvironment {
+    values: BTreeMap<String, String>,
+    sources: BTreeMap<String, EnvSource>,
+}
 
-    vars.insert("WRT_NAME".into(), alloc.name.clone());
-    vars.insert("WRT_BRANCH".into(), alloc.branch.clone());
-    vars.insert("WRT_PORT_BLOCK".into(), alloc.block.to_string());
-    vars.insert("WRT_PORT_OFFSET".into(), alloc.offset.to_string());
-    vars.insert(
-        "WRT_ROOT".into(),
-        repo.managed_root.to_string_lossy().to_string(),
-    );
-    vars.insert(
-        "WRT_WORKTREE_PATH".into(),
-        wt_path.to_string_lossy().to_string(),
-    );
-    vars.insert(
-        "WRT_MAIN_PATH".into(),
-        repo.main_worktree.to_string_lossy().to_string(),
-    );
-    vars.insert(
-        "COMPOSE_PROJECT_NAME".into(),
-        compose_project_name(repo, alloc),
-    );
+#[derive(Clone, Debug)]
+enum EnvSource {
+    Wrt,
+    Compose,
+    ProjectPort(String),
+    ProjectOutput(String),
+    Supabase(String),
+}
 
-    if let Some(discovery) = discovery_for(repo, wt_path) {
-        add_service_vars(&mut vars, &discovery, alloc.offset);
+impl fmt::Display for EnvSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Wrt => write!(formatter, "wrt built-ins"),
+            Self::Compose => write!(formatter, "the Compose project name"),
+            Self::ProjectPort(key) => write!(formatter, "project port {key:?}"),
+            Self::ProjectOutput(key) => write!(formatter, "project port {key:?} output"),
+            Self::Supabase(key) => write!(formatter, "Supabase status field {key:?}"),
+        }
+    }
+}
+
+impl ResolvedEnvironment {
+    pub fn build(
+        repo: &Repo,
+        state: &State,
+        alloc: &Allocation,
+        project: Option<&ProjectConfig>,
+    ) -> Result<Self> {
+        Self::build_inner(repo, state, alloc, project, true)
     }
 
-    if let Some((owner, target)) = supabase::allocation_target(state, alloc)? {
-        let status = supabase::status_env(Path::new(&owner.path), &target)?;
-        add_supabase_vars(&mut vars, &status);
-        vars.insert("WRT_SUPABASE_OWNER".into(), owner.name.clone());
+    pub fn build_before_setup(
+        repo: &Repo,
+        state: &State,
+        alloc: &Allocation,
+        project: Option<&ProjectConfig>,
+    ) -> Result<Self> {
+        Self::build_inner(repo, state, alloc, project, false)
     }
 
-    Ok(vars)
+    fn build_inner(
+        repo: &Repo,
+        state: &State,
+        alloc: &Allocation,
+        project: Option<&ProjectConfig>,
+        include_supabase_status: bool,
+    ) -> Result<Self> {
+        require_project_port_shape(project, alloc)?;
+
+        let mut environment = Self::default();
+        let wt_path = Path::new(&alloc.path);
+        environment.insert_checked(EnvSource::Wrt, "WRT_NAME", alloc.name.clone())?;
+        environment.insert_checked(EnvSource::Wrt, "WRT_BRANCH", alloc.branch.clone())?;
+        environment.insert_checked(EnvSource::Wrt, "WRT_PORT_BLOCK", alloc.block.to_string())?;
+        environment.insert_checked(EnvSource::Wrt, "WRT_PORT_OFFSET", alloc.offset.to_string())?;
+        environment.insert_checked(
+            EnvSource::Wrt,
+            "WRT_ROOT",
+            repo.managed_root.to_string_lossy().to_string(),
+        )?;
+        environment.insert_checked(
+            EnvSource::Wrt,
+            "WRT_WORKTREE_PATH",
+            wt_path.to_string_lossy().to_string(),
+        )?;
+        environment.insert_checked(
+            EnvSource::Wrt,
+            "WRT_MAIN_PATH",
+            repo.main_worktree.to_string_lossy().to_string(),
+        )?;
+        environment.insert_checked(
+            EnvSource::Compose,
+            "COMPOSE_PROJECT_NAME",
+            compose_project_name(repo, alloc),
+        )?;
+
+        if let Some(project) = project {
+            add_project_vars(&mut environment, project, alloc)?;
+        }
+
+        if let Some((owner, target)) = supabase::allocation_target(state, alloc)? {
+            if include_supabase_status {
+                let status = supabase::status_env(Path::new(&owner.path), &target)?;
+                add_supabase_vars(&mut environment, &status)?;
+            }
+            environment.insert_checked(EnvSource::Wrt, "WRT_SUPABASE_OWNER", owner.name.clone())?;
+        }
+
+        Ok(environment)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.values
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+    }
+
+    pub fn apply_to(&self, command: &mut Command) {
+        command.envs(&self.values);
+    }
+
+    fn insert_checked(
+        &mut self,
+        source: EnvSource,
+        name: impl Into<String>,
+        value: String,
+    ) -> Result<()> {
+        let name = name.into();
+        if let Some(existing) = self.values.get(&name) {
+            if existing == &value {
+                return Ok(());
+            }
+            let existing_source = &self.sources[&name];
+            bail!("environment variable {name:?} conflicts between {existing_source} and {source}");
+        }
+        self.sources.insert(name.clone(), source);
+        self.values.insert(name, value);
+        Ok(())
+    }
+}
+
+fn require_project_port_shape(project: Option<&ProjectConfig>, alloc: &Allocation) -> Result<()> {
+    let configured = project
+        .into_iter()
+        .flat_map(ProjectConfig::ports)
+        .map(|spec| spec.key().as_str())
+        .collect::<BTreeSet<_>>();
+    let allocated = alloc
+        .ports
+        .keys()
+        .map(|key| key.as_str())
+        .filter(|key| !key.starts_with("supabase."))
+        .collect::<BTreeSet<_>>();
+    if configured == allocated {
+        return Ok(());
+    }
+
+    let added = configured
+        .difference(&allocated)
+        .copied()
+        .collect::<Vec<_>>();
+    let removed = allocated
+        .difference(&configured)
+        .copied()
+        .collect::<Vec<_>>();
+    bail!(
+        "project port keys changed for worktree {:?}; added since allocation: {added:?}; removed since allocation: {removed:?}; recreate the worktree with `wrt rm {}` and `wrt new {}`",
+        alloc.name,
+        alloc.name,
+        alloc.name
+    )
 }
 
 pub fn sync_env_files(
-    repo: &Repo,
     state: &State,
     wt_path: &Path,
     alloc: &Allocation,
+    environment: &ResolvedEnvironment,
 ) -> Result<()> {
-    let vars = vars(repo, state, alloc)?;
-    write_wrt_env_file(wt_path, &vars)?;
+    write_wrt_env_file(wt_path, environment)?;
 
-    let supabase_vars: BTreeMap<String, String> = vars
+    let supabase_vars: BTreeMap<String, String> = environment
         .iter()
         .filter(|(key, _)| is_supabase_env_name(key))
-        .map(|(key, value)| (key.clone(), value.clone()))
+        .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect();
     let target = supabase::allocation_target(state, alloc)?
         .map(|(_, target)| target)
@@ -100,10 +221,10 @@ pub fn sync_env_files(
     Ok(())
 }
 
-fn write_wrt_env_file(wt_path: &Path, vars: &BTreeMap<String, String>) -> Result<()> {
+fn write_wrt_env_file(wt_path: &Path, environment: &ResolvedEnvironment) -> Result<()> {
     let p = wt_path.join(".wrt.env");
     let mut out = "# Generated by wrt. Safe to edit; re-running wrt may overwrite.\n".to_string();
-    for (k, v) in vars {
+    for (k, v) in environment.iter() {
         out.push_str(k);
         out.push('=');
         out.push_str(&sh_quote(v));
@@ -113,51 +234,47 @@ fn write_wrt_env_file(wt_path: &Path, vars: &BTreeMap<String, String>) -> Result
     Ok(())
 }
 
-pub fn print_exports(repo: &Repo, state: &State, alloc: &Allocation) -> Result<()> {
-    for (k, v) in vars(repo, state, alloc)? {
-        println!("export {k}={}", sh_quote(&v));
+pub fn print_exports(environment: &ResolvedEnvironment) {
+    for (k, v) in environment.iter() {
+        println!("export {k}={}", sh_quote(v));
     }
-    Ok(())
 }
 
-pub fn apply_to_command_env(
-    command: &mut std::process::Command,
-    repo: &Repo,
-    state: &State,
-    alloc: &Allocation,
+fn add_supabase_vars(
+    environment: &mut ResolvedEnvironment,
+    status: &BTreeMap<String, String>,
 ) -> Result<()> {
-    for (k, v) in vars(repo, state, alloc)? {
-        command.env(k, v);
-    }
-    Ok(())
-}
-
-fn add_supabase_vars(vars: &mut BTreeMap<String, String>, status: &BTreeMap<String, String>) {
-    copy_status_var(vars, status, "API_URL", "SUPABASE_URL");
-    copy_status_var(vars, status, "ANON_KEY", "SUPABASE_ANON_KEY");
+    copy_status_var(environment, status, "API_URL", "SUPABASE_URL")?;
+    copy_status_var(environment, status, "ANON_KEY", "SUPABASE_ANON_KEY")?;
     copy_status_var(
-        vars,
+        environment,
         status,
         "SERVICE_ROLE_KEY",
         "SUPABASE_SERVICE_ROLE_KEY",
-    );
-    copy_status_var(vars, status, "JWT_SECRET", "SUPABASE_JWT_SECRET");
-    copy_status_var(vars, status, "DB_URL", "SUPABASE_DB_URL");
-    copy_status_var(vars, status, "DB_URL", "DATABASE_URL");
-    copy_status_var(vars, status, "STUDIO_URL", "SUPABASE_STUDIO_URL");
-    copy_status_var(vars, status, "GRAPHQL_URL", "SUPABASE_GRAPHQL_URL");
-    copy_status_var(vars, status, "INBUCKET_URL", "SUPABASE_INBUCKET_URL");
+    )?;
+    copy_status_var(environment, status, "JWT_SECRET", "SUPABASE_JWT_SECRET")?;
+    copy_status_var(environment, status, "DB_URL", "SUPABASE_DB_URL")?;
+    copy_status_var(environment, status, "DB_URL", "DATABASE_URL")?;
+    copy_status_var(environment, status, "STUDIO_URL", "SUPABASE_STUDIO_URL")?;
+    copy_status_var(environment, status, "GRAPHQL_URL", "SUPABASE_GRAPHQL_URL")?;
+    copy_status_var(environment, status, "INBUCKET_URL", "SUPABASE_INBUCKET_URL")?;
+    Ok(())
 }
 
 fn copy_status_var(
-    vars: &mut BTreeMap<String, String>,
+    environment: &mut ResolvedEnvironment,
     status: &BTreeMap<String, String>,
     source: &str,
     destination: &str,
-) {
+) -> Result<()> {
     if let Some(value) = status.get(source) {
-        vars.insert(destination.to_string(), value.clone());
+        environment.insert_checked(
+            EnvSource::Supabase(source.to_string()),
+            destination,
+            value.clone(),
+        )?;
     }
+    Ok(())
 }
 
 fn env_output_path(wt_path: &Path, path: &Path, relative: &Path) -> Result<std::path::PathBuf> {
@@ -254,59 +371,36 @@ fn remove_block_from_string(input: &mut String) -> Result<bool> {
     Ok(true)
 }
 
-fn discovery_for(repo: &Repo, wt_path: &Path) -> Option<codex::Discovery> {
-    let local = wt_path.join(".wrt.json");
-    if let Some(d) = read_discovery(&local) {
-        return Some(d);
-    }
+fn add_project_vars(
+    environment: &mut ResolvedEnvironment,
+    config: &ProjectConfig,
+    allocation: &Allocation,
+) -> Result<()> {
+    for spec in config.ports() {
+        let key = spec.key().as_str();
+        let port = allocation.ports[spec.key()];
 
-    let fallback = repo.config_root.join(".wrt.json");
-    if fallback != local {
-        return read_discovery(&fallback);
-    }
-    None
-}
-
-fn read_discovery(path: &Path) -> Option<codex::Discovery> {
-    let s = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&s).ok()
-}
-
-fn add_service_vars(
-    vars: &mut BTreeMap<String, String>,
-    discovery: &codex::Discovery,
-    offset: i32,
-) {
-    for service in &discovery.services {
-        let Some(base_port) = service.base_port else {
-            continue;
-        };
-        let port = base_port + offset;
-        if !(1..=65535).contains(&port) {
-            continue;
-        }
-
-        let service_key = sanitize_env_part(&service.name);
-        vars.insert(format!("WRT_SERVICE_{service_key}_PORT"), port.to_string());
-        vars.insert(
-            format!("WRT_SERVICE_{service_key}_URL"),
+        let port_key = key.replace('-', "_").to_ascii_uppercase();
+        environment.insert_checked(
+            EnvSource::ProjectPort(key.to_string()),
+            format!("WRT_SERVICE_{port_key}_PORT"),
+            port.to_string(),
+        )?;
+        environment.insert_checked(
+            EnvSource::ProjectPort(key.to_string()),
+            format!("WRT_SERVICE_{port_key}_URL"),
             format!("http://localhost:{port}"),
-        );
+        )?;
 
-        if let Some(port_env) = service.port_env.as_deref() {
-            let port_env = port_env.trim();
-            if is_valid_env_name(port_env) {
-                vars.insert(port_env.to_string(), port.to_string());
-            }
-        }
-
-        if let Some(url_env) = service.url_env.as_deref() {
-            let url_env = url_env.trim();
-            if is_valid_env_name(url_env) {
-                vars.insert(url_env.to_string(), format!("http://localhost:{port}"));
-            }
+        for output in spec.outputs() {
+            environment.insert_checked(
+                EnvSource::ProjectOutput(key.to_string()),
+                output.env(),
+                output.render(port),
+            )?;
         }
     }
+    Ok(())
 }
 
 fn compose_project_name(repo: &Repo, alloc: &Allocation) -> String {
@@ -315,54 +409,30 @@ fn compose_project_name(repo: &Repo, alloc: &Allocation) -> String {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("repo");
-    let mut out = worktree::slug(&format!("wrt-{root_name}-{}", alloc.name));
-    if out.len() > 63 {
-        out.truncate(63);
-        out = out.trim_matches('-').to_string();
+    let full = worktree::slug(&format!("wrt-{root_name}-{}", alloc.name));
+    if full.len() <= 63 {
+        return full;
     }
-    if out.is_empty() {
-        "wrt".to_string()
-    } else {
-        out
-    }
+
+    let hash = stable_hash(&full);
+    let prefix = full[..54].trim_end_matches('-');
+    format!("{prefix}-{hash:08x}")
 }
 
-fn sanitize_env_part(s: &str) -> String {
-    let mut out = String::new();
-    let mut prev_sep = false;
-    for ch in s.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_uppercase());
-            prev_sep = false;
-        } else if !prev_sep {
-            out.push('_');
-            prev_sep = true;
-        }
+fn stable_hash(value: &str) -> u32 {
+    let mut hash = 2_166_136_261_u32;
+    for byte in value.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(16_777_619);
     }
-    let out = out.trim_matches('_').to_string();
-    if out.is_empty() {
-        "SERVICE".to_string()
-    } else {
-        out
-    }
-}
-
-fn is_valid_env_name(s: &str) -> bool {
-    let mut chars = s.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if first != '_' && !first.is_ascii_alphabetic() {
-        return false;
-    }
-    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    hash
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::gitx::Repo;
-    use crate::state::{Allocation, State, SupabaseAllocation};
+    use crate::state::{Allocation, State, SupabaseAllocation, project_port_assignments};
     use tempfile::TempDir;
 
     fn repo(root: &Path) -> Repo {
@@ -379,80 +449,169 @@ mod tests {
 
     fn alloc(path: &Path) -> Allocation {
         Allocation {
+            generation_id: crate::state::AllocationGeneration::new(),
             name: "x".into(),
             branch: "x".into(),
             path: path.to_string_lossy().to_string(),
             block: 1,
             offset: 100,
+            ports: Default::default(),
             status: "active".into(),
             created_at: "now".into(),
             supabase: SupabaseAllocation::None,
+            setup: crate::state::AllocationSetup::default(),
         }
     }
 
-    #[test]
-    fn includes_base_and_discovered_service_vars() {
-        let td = TempDir::new().unwrap();
-        fs::write(
-            td.path().join(".wrt.json"),
-            r#"{
-  "version": 1,
-  "port_block_size": 100,
-  "package_manager": { "name": "unknown", "install_command": ["npm","install"], "notes": null },
-  "services": [{ "name": "web app", "kind": "web", "dev_command": ["npm","run","dev"], "base_port": 3000, "port_env": "PORT", "url_env": "APP_URL", "notes": null }],
-  "database": { "detected": false, "kind": null, "migrate_command": null, "seed_command": null, "reset_command": null, "notes": null },
-  "supabase": { "detected": false, "config_path": null, "start_command": null, "base_ports": null, "notes": null },
-  "notes": null
-}
-"#,
-        )
-        .unwrap();
-
-        let vars = vars(&repo(td.path()), &State::empty(), &alloc(td.path())).unwrap();
-        assert_eq!(vars.get("WRT_NAME").unwrap(), "x");
-        assert_eq!(vars.get("WRT_PORT_OFFSET").unwrap(), "100");
-        assert_eq!(vars.get("PORT").unwrap(), "3100");
-        assert_eq!(vars.get("APP_URL").unwrap(), "http://localhost:3100");
-        assert_eq!(vars.get("WRT_SERVICE_WEB_APP_PORT").unwrap(), "3100");
+    fn config(input: &str) -> ProjectConfig {
+        let input = crate::project::complete_v2_fixture(input);
+        ProjectConfig::from_slice(&input).unwrap()
     }
 
     #[test]
-    fn checkout_config_overrides_managed_root_config() {
+    fn renders_eln_outputs_from_persisted_assignments() {
         let td = TempDir::new().unwrap();
-        let checkout = td.path().join("feature");
-        fs::create_dir_all(&checkout).unwrap();
-        fs::write(
-            td.path().join(".wrt.json"),
+        let project = config(
             r#"{
-  "version": 1,
-  "port_block_size": 100,
-  "package_manager": { "name": "unknown", "install_command": ["npm","install"], "notes": null },
-  "services": [{ "name": "web app", "kind": "web", "dev_command": ["npm","run","dev"], "base_port": 3000, "port_env": "PORT", "url_env": "APP_URL", "notes": null }],
-  "database": { "detected": false, "kind": null, "migrate_command": null, "seed_command": null, "reset_command": null, "notes": null },
-  "supabase": { "detected": false, "config_path": null, "start_command": null, "base_ports": null, "notes": null },
-  "notes": null
-}
-"#,
-        )
-        .unwrap();
-        fs::write(
-            checkout.join(".wrt.json"),
-            r#"{
-  "version": 1,
-  "port_block_size": 100,
-  "package_manager": { "name": "unknown", "install_command": ["npm","install"], "notes": null },
-  "services": [{ "name": "web app", "kind": "web", "dev_command": ["npm","run","dev"], "base_port": 4000, "port_env": "PORT", "url_env": "APP_URL", "notes": null }],
-  "database": { "detected": false, "kind": null, "migrate_command": null, "seed_command": null, "reset_command": null, "notes": null },
-  "supabase": { "detected": false, "config_path": null, "start_command": null, "base_ports": null, "notes": null },
-  "notes": null
-}
-"#,
-        )
-        .unwrap();
+              "version": 2,
+              "port_stride": 100,
+              "ports": [
+                {"key":"postgres","base_port":5432,"outputs":[{"env":"DATABASE_URL","template":"postgresql://postgres:postgres@localhost:{port}/eln"}]},
+                {"key":"redis","base_port":6379,"outputs":[{"env":"REDIS_URL","template":"redis://localhost:{port}"}]},
+                {"key":"rabbitmq","base_port":5672,"outputs":[{"env":"AMQP_URL","template":"amqp://localhost:{port}"}]},
+                {"key":"core-api","base_port":3000,"outputs":[{"env":"CORE_API_PORT","template":"{port}"},{"env":"CORE_API_URL","template":"http://localhost:{port}/api/v1"}]},
+                {"key":"oauth","base_port":8181,"outputs":[{"env":"OAUTH_CALLBACK_URL","template":"http://localhost:{port}/callback"}]}
+              ]
+            }"#,
+        );
+        let mut allocation = alloc(td.path());
+        for spec in project.ports() {
+            let port = match spec.key().as_str() {
+                "postgres" => 15432,
+                "redis" => 16379,
+                "rabbitmq" => 15672,
+                "core-api" => 13000,
+                "oauth" => 18181,
+                _ => unreachable!(),
+            };
+            allocation.ports.insert(spec.key().clone(), port);
+        }
 
-        let vars = vars(&repo(td.path()), &State::empty(), &alloc(&checkout)).unwrap();
-        assert_eq!(vars.get("PORT").unwrap(), "4100");
-        assert_eq!(vars.get("APP_URL").unwrap(), "http://localhost:4100");
+        let environment = ResolvedEnvironment::build(
+            &repo(td.path()),
+            &State::empty(),
+            &allocation,
+            Some(&project),
+        )
+        .unwrap();
+        assert_eq!(environment.values["WRT_NAME"], "x");
+        assert_eq!(environment.values["WRT_PORT_OFFSET"], "100");
+        assert_eq!(
+            environment.values["DATABASE_URL"],
+            "postgresql://postgres:postgres@localhost:15432/eln"
+        );
+        assert_eq!(environment.values["REDIS_URL"], "redis://localhost:16379");
+        assert_eq!(environment.values["AMQP_URL"], "amqp://localhost:15672");
+        assert_eq!(environment.values["CORE_API_PORT"], "13000");
+        assert_eq!(
+            environment.values["CORE_API_URL"],
+            "http://localhost:13000/api/v1"
+        );
+        assert_eq!(
+            environment.values["OAUTH_CALLBACK_URL"],
+            "http://localhost:18181/callback"
+        );
+        assert_eq!(environment.values["WRT_SERVICE_CORE_API_PORT"], "13000");
+    }
+
+    #[test]
+    fn requires_exact_generic_assignment_keys_and_ignores_supabase_claims() {
+        let td = TempDir::new().unwrap();
+        let original =
+            config(r#"{"version":2,"port_stride":100,"ports":[{"key":"web","base_port":3000}]}"#);
+        let changed =
+            config(r#"{"version":2,"port_stride":100,"ports":[{"key":"api","base_port":3001}]}"#);
+        let mut allocation = alloc(td.path());
+        allocation.ports = project_port_assignments(&original, allocation.offset).unwrap();
+        let supabase_key = serde_json::from_str(r#""supabase.api.port""#).unwrap();
+        allocation.ports.insert(supabase_key, 54321);
+
+        ResolvedEnvironment::build(
+            &repo(td.path()),
+            &State::empty(),
+            &allocation,
+            Some(&original),
+        )
+        .unwrap();
+        let error = ResolvedEnvironment::build(
+            &repo(td.path()),
+            &State::empty(),
+            &allocation,
+            Some(&changed),
+        )
+        .unwrap_err();
+        let error = error.to_string();
+        assert!(
+            error.contains("added since allocation: [\"api\"]"),
+            "{error}"
+        );
+        assert!(
+            error.contains("removed since allocation: [\"web\"]"),
+            "{error}"
+        );
+        assert!(error.contains("recreate the worktree"), "{error}");
+    }
+
+    #[test]
+    fn checked_insertion_rejects_conflicts_and_allows_equal_values() {
+        let mut environment = ResolvedEnvironment::default();
+        environment
+            .insert_checked(
+                EnvSource::ProjectOutput("postgres".into()),
+                "DATABASE_URL",
+                "postgresql://project".into(),
+            )
+            .unwrap();
+        environment
+            .insert_checked(
+                EnvSource::ProjectOutput("replica".into()),
+                "DATABASE_URL",
+                "postgresql://project".into(),
+            )
+            .unwrap();
+
+        let error = environment
+            .insert_checked(
+                EnvSource::Supabase("DB_URL".into()),
+                "DATABASE_URL",
+                "postgresql://supabase".into(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("project port \"postgres\" output"),
+            "{error}"
+        );
+        assert!(
+            error.contains("Supabase status field \"DB_URL\""),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn truncated_compose_names_include_a_stable_hash() {
+        let td = TempDir::new().unwrap();
+        let mut first = alloc(td.path());
+        first.name = format!("feature-{}-one", "a".repeat(80));
+        let mut second = first.clone();
+        second.name = format!("feature-{}-two", "a".repeat(80));
+
+        let first_name = compose_project_name(&repo(td.path()), &first);
+        let second_name = compose_project_name(&repo(td.path()), &second);
+        assert_eq!(first_name.len(), 63);
+        assert_eq!(second_name.len(), 63);
+        assert_ne!(first_name, second_name);
+        assert_eq!(first_name, compose_project_name(&repo(td.path()), &first));
     }
 
     #[test]

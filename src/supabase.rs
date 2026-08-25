@@ -1,11 +1,13 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use toml_edit::{DocumentMut, InlineTable, Item, Table, Value, value};
 
-use crate::state::{Allocation, State, SupabaseAllocation};
+use crate::project::PortKey;
+use crate::project::ProjectConfig;
+use crate::state::{Allocation, PortAssignments, State, SupabaseAllocation};
 
 pub const DEFAULT_CONFIG_PATH: &str = "supabase/config.toml";
 
@@ -75,15 +77,20 @@ impl Target {
 }
 
 pub fn resolve_target(
-    repo_root: &Path,
     explicit: Option<&str>,
     stored: Option<&str>,
+    project: Option<&ProjectConfig>,
 ) -> Result<Target> {
-    let configured = explicit
-        .map(str::to_string)
-        .or_else(|| stored.map(str::to_string))
-        .or_else(|| discovery_config_path(repo_root))
-        .unwrap_or_else(|| DEFAULT_CONFIG_PATH.to_string());
+    let configured = if let Some(explicit) = explicit {
+        explicit.to_string()
+    } else if let Some(stored) = stored {
+        stored.to_string()
+    } else {
+        project
+            .and_then(ProjectConfig::supabase)
+            .map(|supabase| supabase.config_path().to_string_lossy().into_owned())
+            .unwrap_or_else(|| DEFAULT_CONFIG_PATH.to_string())
+    };
     Target::from_config_path(&configured)
 }
 
@@ -138,6 +145,94 @@ pub fn project_id(repo_root: &Path, target: &Target) -> Result<String> {
         .ok_or_else(|| anyhow!("{} has no project_id", path.display()))
 }
 
+pub fn port_claims(repo_root: &Path, target: &Target, offset: i32) -> Result<PortAssignments> {
+    let path = target.absolute_config_path(repo_root);
+    let input = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let document = input
+        .parse::<DocumentMut>()
+        .with_context(|| format!("parse {}", path.display()))?;
+    let mut claims = PortAssignments::new();
+    collect_table_port_claims(document.as_table(), &mut Vec::new(), offset, &mut claims)?;
+    Ok(claims)
+}
+
+fn collect_table_port_claims(
+    table: &Table,
+    path: &mut Vec<String>,
+    offset: i32,
+    claims: &mut PortAssignments,
+) -> Result<()> {
+    for (key, item) in table.iter() {
+        path.push(key.to_string());
+        collect_item_port_claims(Some(key), item, path, offset, claims)?;
+        path.pop();
+    }
+    Ok(())
+}
+
+fn collect_item_port_claims(
+    key: Option<&str>,
+    item: &Item,
+    path: &mut Vec<String>,
+    offset: i32,
+    claims: &mut PortAssignments,
+) -> Result<()> {
+    match item {
+        Item::None => Ok(()),
+        Item::Value(value) => collect_value_port_claims(key, value, path, offset, claims),
+        Item::Table(table) => collect_table_port_claims(table, path, offset, claims),
+        Item::ArrayOfTables(tables) => {
+            for (index, table) in tables.iter().enumerate() {
+                path.push(index.to_string());
+                collect_table_port_claims(table, path, offset, claims)?;
+                path.pop();
+            }
+            Ok(())
+        }
+    }
+}
+
+fn collect_value_port_claims(
+    key: Option<&str>,
+    value: &Value,
+    path: &mut Vec<String>,
+    offset: i32,
+    claims: &mut PortAssignments,
+) -> Result<()> {
+    if key.is_some_and(is_port_key) {
+        if let Some(port) = value.as_integer().filter(|port| *port != 0) {
+            let concrete = port.checked_add(i64::from(offset)).ok_or_else(|| {
+                anyhow!("Supabase port arithmetic overflow after offset: {port} + {offset}")
+            })?;
+            if !(1..=65535).contains(&concrete) {
+                bail!("Supabase port out of range after offset: {port} -> {concrete}");
+            }
+            claims.insert(PortKey::supabase_claim(path), concrete as u16);
+            return Ok(());
+        }
+    }
+
+    match value {
+        Value::Array(array) => {
+            for (index, value) in array.iter().enumerate() {
+                path.push(index.to_string());
+                collect_value_port_claims(None, value, path, offset, claims)?;
+                path.pop();
+            }
+            Ok(())
+        }
+        Value::InlineTable(table) => {
+            for (key, value) in table.iter() {
+                path.push(key.to_string());
+                collect_value_port_claims(Some(key), value, path, offset, claims)?;
+                path.pop();
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 pub fn ensure_started(repo_root: &Path, target: &Target) -> Result<BTreeMap<String, String>> {
     if let Ok(status) = status_env(repo_root, target) {
         return Ok(status);
@@ -186,21 +281,12 @@ pub fn stop(repo_root: &Path, target: &Target) -> Result<()> {
     crate::util::run_cmd(&workdir, "supabase", &["stop"])
 }
 
-fn discovery_config_path(repo_root: &Path) -> Option<String> {
-    let input = fs::read_to_string(repo_root.join(".wrt.json")).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&input).ok()?;
-    value
-        .get("supabase")?
-        .get("config_path")?
-        .as_str()
-        .map(str::to_string)
-}
-
 // patch_config updates supabase/config.toml inside the given worktree directory so multiple local
 // supabase instances can run concurrently:
 // - project_id gets a suffix derived from worktree name
 // - port/shadow_port etc are incremented by offset
 // - localhost URLs with explicit ports get the same offset
+#[cfg(test)]
 pub fn patch_config(
     worktree_root: &Path,
     target: &Target,
@@ -242,6 +328,160 @@ pub fn patch_config(
     Ok(())
 }
 
+pub fn patch_config_to_claims(
+    worktree_root: &Path,
+    target: &Target,
+    worktree_name: &str,
+    offset: i32,
+    allocation_ports: &PortAssignments,
+) -> Result<()> {
+    let path = target.absolute_config_path(worktree_root);
+    let input = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let mut document = input
+        .parse::<DocumentMut>()
+        .with_context(|| format!("parse {}", path.display()))?;
+    let current = port_claims(worktree_root, target, 0)?;
+    let expected = allocation_ports
+        .iter()
+        .filter(|(key, _)| key.as_str().starts_with("supabase."))
+        .map(|(key, port)| (key.clone(), *port))
+        .collect::<PortAssignments>();
+    if current.keys().collect::<Vec<_>>() != expected.keys().collect::<Vec<_>>() {
+        bail!("Supabase config port keys changed since allocation; recreate the worktree");
+    }
+
+    let suffix = sanitize_suffix(worktree_name);
+    let project_already_patched = document
+        .get("project_id")
+        .and_then(Item::as_str)
+        .is_some_and(|project_id| {
+            !suffix.is_empty() && project_id.ends_with(&format!("-{suffix}"))
+        });
+    let mut changed = patch_exact_claims(document.as_table_mut(), &mut Vec::new(), &expected)?;
+    if let Some(project_id) = document.get("project_id").and_then(Item::as_str)
+        && !suffix.is_empty()
+        && !project_already_patched
+    {
+        document["project_id"] = value(format!("{project_id}-{suffix}"));
+        changed = true;
+    }
+    if current != expected && !project_already_patched {
+        changed |= patch_table_strings(document.as_table_mut(), offset)?;
+    }
+    if !changed {
+        return Ok(());
+    }
+    let mut output = document.to_string();
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
+    fs::write(&path, output).with_context(|| format!("write {}", path.display()))
+}
+
+fn patch_exact_claims(
+    table: &mut Table,
+    path: &mut Vec<String>,
+    expected: &PortAssignments,
+) -> Result<bool> {
+    let mut changed = false;
+    for (key, item) in table.iter_mut() {
+        path.push(key.to_string());
+        match item {
+            Item::Value(value) => {
+                changed |= patch_exact_value(Some(key.get()), value, path, expected)?;
+            }
+            Item::Table(nested) => changed |= patch_exact_claims(nested, path, expected)?,
+            Item::ArrayOfTables(tables) => {
+                for (index, nested) in tables.iter_mut().enumerate() {
+                    path.push(index.to_string());
+                    changed |= patch_exact_claims(nested, path, expected)?;
+                    path.pop();
+                }
+            }
+            Item::None => {}
+        }
+        path.pop();
+    }
+    Ok(changed)
+}
+
+fn patch_exact_value(
+    key: Option<&str>,
+    value: &mut Value,
+    path: &mut Vec<String>,
+    expected: &PortAssignments,
+) -> Result<bool> {
+    if key.is_some_and(is_port_key) && value.as_integer().is_some_and(|port| port != 0) {
+        let claim = PortKey::supabase_claim(path);
+        let desired = expected
+            .get(&claim)
+            .ok_or_else(|| anyhow!("Supabase config port key changed since allocation"))?;
+        if value.as_integer() != Some(i64::from(*desired)) {
+            replace_value_preserving_decor(value, Value::from(i64::from(*desired)));
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+    let mut changed = false;
+    match value {
+        Value::Array(array) => {
+            for (index, value) in array.iter_mut().enumerate() {
+                path.push(index.to_string());
+                changed |= patch_exact_value(None, value, path, expected)?;
+                path.pop();
+            }
+        }
+        Value::InlineTable(table) => {
+            for (key, value) in table.iter_mut() {
+                path.push(key.to_string());
+                changed |= patch_exact_value(Some(key.get()), value, path, expected)?;
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+    Ok(changed)
+}
+
+fn patch_table_strings(table: &mut Table, offset: i32) -> Result<bool> {
+    let mut changed = false;
+    for (_, item) in table.iter_mut() {
+        match item {
+            Item::Value(value) => changed |= patch_strings_value(value, offset)?,
+            Item::Table(nested) => changed |= patch_table_strings(nested, offset)?,
+            Item::ArrayOfTables(tables) => {
+                for nested in tables.iter_mut() {
+                    changed |= patch_table_strings(nested, offset)?;
+                }
+            }
+            Item::None => {}
+        }
+    }
+    Ok(changed)
+}
+
+fn patch_strings_value(value: &mut Value, offset: i32) -> Result<bool> {
+    if value.as_str().is_some() {
+        return patch_value(None, value, offset);
+    }
+    let mut changed = false;
+    match value {
+        Value::Array(array) => {
+            for value in array.iter_mut() {
+                changed |= patch_strings_value(value, offset)?;
+            }
+        }
+        Value::InlineTable(table) => {
+            for (_, value) in table.iter_mut() {
+                changed |= patch_strings_value(value, offset)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(changed)
+}
+
+#[cfg(test)]
 fn patch_table(table: &mut Table, offset: i32) -> Result<bool> {
     let mut changed = false;
     for (key, item) in table.iter_mut() {
@@ -250,6 +490,7 @@ fn patch_table(table: &mut Table, offset: i32) -> Result<bool> {
     Ok(changed)
 }
 
+#[cfg(test)]
 fn patch_item(key: Option<&str>, item: &mut Item, offset: i32) -> Result<bool> {
     match item {
         Item::None => Ok(false),
@@ -271,7 +512,9 @@ fn patch_value(key: Option<&str>, value: &mut Value, offset: i32) -> Result<bool
             if n == 0 {
                 return Ok(false);
             }
-            let n2 = n + i64::from(offset);
+            let n2 = n
+                .checked_add(i64::from(offset))
+                .ok_or_else(|| anyhow!("port arithmetic overflow after offset: {n} + {offset}"))?;
             if !(1..=65535).contains(&n2) {
                 return Err(anyhow!("port out of range after offset: {n} -> {n2}"));
             }
@@ -346,8 +589,10 @@ fn patch_local_url_ports(line: &str, offset: i32) -> String {
 
         let port_end = port_start + port_len;
         let port: i32 = line[port_start..port_end].parse().unwrap_or(0);
-        let p2 = port + offset;
-        if (1..=65535).contains(&p2) {
+        if let Some(p2) = port
+            .checked_add(offset)
+            .filter(|port| (1..=65535).contains(port))
+        {
             out.push_str(&p2.to_string());
         } else {
             out.push_str(&line[port_start..port_end]);
@@ -520,6 +765,53 @@ mod tests {
     }
 
     #[test]
+    fn patch_config_ports_are_idempotent_for_the_same_worktree() {
+        let td = tempfile::TempDir::new().unwrap();
+        let path = td.path().join("supabase/config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            "project_id = \"project\"\n[api]\nport = 54321\nsite_url = \"http://localhost:3000\"\n",
+        )
+        .unwrap();
+
+        let expected = port_claims(td.path(), &target(), 100).unwrap();
+        patch_config_to_claims(td.path(), &target(), "feature", 100, &expected).unwrap();
+        let once = fs::read_to_string(&path).unwrap();
+        patch_config_to_claims(td.path(), &target(), "feature", 100, &expected).unwrap();
+
+        assert_eq!(fs::read_to_string(path).unwrap(), once);
+        assert!(once.contains("port = 54421"), "{once}");
+        assert!(once.contains("localhost:3100"), "{once}");
+    }
+
+    #[test]
+    fn patch_config_repairs_mixed_claims_without_double_offsetting() {
+        let td = tempfile::TempDir::new().unwrap();
+        let path = td.path().join("supabase/config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            "project_id = \"project\"\n[api]\nport = 54321\nsite_url = \"http://localhost:3000\"\n[db]\nport = 54322\n",
+        )
+        .unwrap();
+        let expected = port_claims(td.path(), &target(), 100).unwrap();
+        fs::write(
+            &path,
+            "project_id = \"project-feature\"\n[api]\nport = 54421\nsite_url = \"http://localhost:3100\"\n[db]\nport = 54322\n",
+        )
+        .unwrap();
+
+        patch_config_to_claims(td.path(), &target(), "feature", 100, &expected).unwrap();
+        let output = fs::read_to_string(path).unwrap();
+
+        assert!(output.contains("port = 54421"), "{output}");
+        assert!(output.contains("port = 54422"), "{output}");
+        assert!(output.contains("localhost:3100"), "{output}");
+        assert!(!output.contains("54521"), "{output}");
+    }
+
+    #[test]
     fn patch_config_no_change_when_already_suffixed() {
         let td = TempDir::new().unwrap();
         let sbdir = td.path().join("supabase");
@@ -612,6 +904,29 @@ additional_redirect_urls = ["http://localhost:3001/callback", "https://127.0.0.1
         assert!(out.contains("http://localhost:3100"));
         assert!(out.contains("http://localhost:3101/callback"));
         assert!(out.contains("https://127.0.0.1:3102/auth"));
+    }
+
+    #[test]
+    fn port_claims_exclude_ports_found_only_in_urls() {
+        let td = TempDir::new().unwrap();
+        let sbdir = td.path().join("supabase");
+        fs::create_dir_all(&sbdir).unwrap();
+        fs::write(
+            sbdir.join("config.toml"),
+            r#"project_id = "myproj"
+[api]
+port = 54321
+[auth]
+site_url = "http://localhost:3000"
+additional_redirect_urls = ["http://localhost:3001/callback"]
+"#,
+        )
+        .unwrap();
+
+        let claims = port_claims(td.path(), &target(), 0).unwrap();
+
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims.values().copied().next(), Some(54321));
     }
 
     #[test]

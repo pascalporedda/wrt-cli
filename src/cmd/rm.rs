@@ -3,7 +3,7 @@ use std::io::IsTerminal;
 use std::path::Path;
 
 use crate::gitx;
-use crate::state::{State, SupabaseAllocation};
+use crate::state::{State, StateStore, SupabaseAllocation};
 use crate::supabase;
 use crate::ui;
 use crate::util::{confirm, which};
@@ -12,6 +12,7 @@ use crate::worktree;
 pub fn cmd_rm(
     log: &ui::Logger,
     repo: &gitx::Repo,
+    store: &StateStore,
     st: &mut State,
     name: &str,
     force: bool,
@@ -22,11 +23,11 @@ pub fn cmd_rm(
         log.errorf(&format!("unknown worktree: \"{key}\""));
         return Ok(2);
     };
+    let generation_id = a.generation_id;
     if st.is_primary_allocation(&a) {
         log.errorf("the main worktree cannot be removed");
         return Ok(2);
     }
-
     let interactive = std::io::stdin().is_terminal();
     let upstream = if delete_branch || interactive {
         worktree::branch_upstream(&repo.common_dir, &a.branch)?
@@ -35,6 +36,16 @@ pub fn cmd_rm(
     };
     let delete_branch = delete_branch
         || (interactive && confirm(&branch_delete_prompt(&a.branch, upstream.as_ref()))?);
+
+    let _lifecycle = store.lock_allocation(&key)?;
+    *st = store.read()?;
+    let current = st
+        .allocations
+        .get(&key)
+        .ok_or_else(|| anyhow::anyhow!("allocation {key:?} was removed before cleanup"))?;
+    if current.generation_id != generation_id {
+        anyhow::bail!("allocation {key:?} was replaced before cleanup");
+    }
 
     log.infof(&format!("removing worktree: {} ({})", a.name, a.path));
 
@@ -103,11 +114,14 @@ pub fn cmd_rm(
             "Supabase cleanup is still required: supabase stop --project-id {project_id}"
         ));
     }
-    st.allocations.remove(&key);
-    if let Err(e) = st.save(&repo.common_dir) {
+    if let Err(e) = store.update(|state| {
+        state.remove_if_generation(&key, generation_id)?;
+        Ok(())
+    }) {
         log.errorf(&format!("state save failed: {e}"));
         return Ok(1);
     }
+    *st = store.read()?;
 
     Ok(i32::from(branch_cleanup_failed))
 }

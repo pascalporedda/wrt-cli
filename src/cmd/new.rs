@@ -4,14 +4,19 @@ use std::io::IsTerminal;
 use std::path::Path;
 
 use crate::cli::FeatureSupabaseMode;
+use crate::compose;
 use crate::db;
 use crate::envx;
 use crate::gitx;
 use crate::pm;
-use crate::state::{Allocation, State, SupabaseAllocation};
+use crate::project::{CommandSpec, ProjectConfig};
+use crate::state::{
+    Allocation, AllocationGeneration, AllocationSetup, PortAssignments, ReservationRequest, State,
+    StateStore, SupabaseAllocation, merge_port_assignments, reserve_ports,
+};
 use crate::supabase;
 use crate::ui;
-use crate::util::{confirm, run_argv_with_wrt_env, run_cmd, sh_quote, which};
+use crate::util::{confirm, run_argv_with_wrt_env, run_cmd, run_project_command, sh_quote, which};
 use crate::worktree;
 
 pub struct NewOpts<'a> {
@@ -25,9 +30,16 @@ pub struct NewOpts<'a> {
     pub emit_cd: bool,
 }
 
+#[derive(Clone, Copy)]
 pub struct SetupModes<'a> {
     pub install_mode: &'a str,
     pub db_mode: &'a str,
+}
+
+#[derive(Clone, Copy)]
+enum SetupPlan<'a> {
+    ProjectCommand(&'a CommandSpec),
+    LegacySetup(SetupModes<'a>),
 }
 
 enum ResolvedSupabaseMode {
@@ -39,6 +51,7 @@ enum ResolvedSupabaseMode {
 pub fn cmd_new(
     log: &ui::Logger,
     repo: &gitx::Repo,
+    store: &StateStore,
     st: &mut State,
     opts: NewOpts<'_>,
 ) -> Result<i32> {
@@ -58,15 +71,6 @@ pub fn cmd_new(
         return Ok(2);
     }
 
-    let block = match st.allocate_block() {
-        Ok(b) => b,
-        Err(e) => {
-            log.errorf(&format!("allocate port block: {e}"));
-            return Ok(1);
-        }
-    };
-    let offset = block * 100;
-
     log.infof(&format!(
         "creating worktree: {wt_name} ({br}) at {}",
         wt_path.display()
@@ -79,52 +83,110 @@ pub fn cmd_new(
         return Ok(1);
     }
 
-    let created_at = chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-    let supabase = match resolve_feature_supabase(log, repo, st, &wt_path, &opts) {
-        Ok(supabase) => supabase,
+    let project_config = match ProjectConfig::load_for(&repo.config_root, &wt_path) {
+        Ok(config) => config,
         Err(error) => {
-            log.errorf(&format!("Supabase setup selection failed: {error}"));
-            let _ = worktree::remove(&repo.common_dir, &wt_path, true);
+            log.errorf(&format!("project config failed: {error}"));
+            remove_failed_worktree(log, repo, &wt_path);
             return Ok(2);
         }
     };
-    let alloc = Allocation {
-        name: wt_name.clone(),
-        branch: br.clone(),
-        path: wt_path.to_string_lossy().to_string(),
-        block,
-        offset,
-        status: "creating".to_string(),
-        created_at,
-        supabase,
+    let supabase = match resolve_feature_supabase(
+        log,
+        repo,
+        store,
+        st,
+        &wt_path,
+        project_config.as_ref(),
+        &opts,
+    ) {
+        Ok(supabase) => supabase,
+        Err(error) => {
+            log.errorf(&format!("Supabase setup selection failed: {error}"));
+            remove_failed_worktree(log, repo, &wt_path);
+            return Ok(2);
+        }
     };
-
-    st.allocations.insert(wt_name.clone(), alloc.clone());
-    if let Err(e) = st.save(&repo.common_dir) {
-        log.errorf(&format!("state save failed: {e}"));
+    let supabase_base_claims = match isolated_supabase_port_claims(&wt_path, &supabase) {
+        Ok(claims) => claims,
+        Err(error) => {
+            log.errorf(&format!("Supabase port discovery failed: {error}"));
+            remove_failed_worktree(log, repo, &wt_path);
+            return Ok(2);
+        }
+    };
+    let reservation_request =
+        ReservationRequest::new(project_config.as_ref(), supabase_base_claims);
+    let created_at = chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let generation_id = AllocationGeneration::new();
+    let reserved = store.update(|state| {
+        if state.allocations.contains_key(&wt_name) {
+            anyhow::bail!("worktree {wt_name:?} already exists in state; use `wrt ls`");
+        }
+        let reservation = reserve_ports(state, &reservation_request)?;
+        let allocation = Allocation {
+            generation_id,
+            name: wt_name.clone(),
+            branch: br.clone(),
+            path: wt_path.to_string_lossy().to_string(),
+            block: reservation.block,
+            offset: reservation.offset,
+            ports: reservation.ports,
+            status: "creating".to_string(),
+            created_at,
+            supabase,
+            setup: AllocationSetup {
+                install: opts.install_mode.to_string(),
+                db: opts.db_mode.to_string(),
+            },
+        };
+        state.allocations.insert(wt_name.clone(), allocation);
+        Ok(())
+    });
+    if let Err(error) = reserved {
+        log.errorf(&format!("reserve allocation failed: {error:#}"));
+        if let Err(cleanup_error) = clear_failed_reservation(store, &wt_name, generation_id) {
+            log.errorf(&format!(
+                "reservation cleanup failed; keeping worktree {}: {cleanup_error:#}",
+                wt_path.display()
+            ));
+            return Ok(1);
+        }
+        remove_failed_worktree(log, repo, &wt_path);
         return Ok(1);
     }
+    *st = store.read()?;
 
     let setup = SetupModes {
         install_mode: opts.install_mode,
         db_mode: opts.db_mode,
     };
-    if let Err(e) = setup_existing_worktree(log, repo, st, &wt_name, &wt_path, setup) {
-        if let Some(a) = st.allocations.get_mut(&wt_name) {
-            a.status = "failed".to_string();
+    let setup_allocation = st
+        .allocations
+        .get(&wt_name)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("reserved allocation is missing: {wt_name}"))?;
+    if let Err(e) = setup_existing_worktree(
+        log,
+        repo,
+        store,
+        st,
+        &setup_allocation,
+        project_config.as_ref(),
+        setup,
+    ) {
+        if let Err(status_error) = update_status(store, &wt_name, generation_id, "failed") {
+            log.errorf(&format!("record setup failure failed: {status_error}"));
         }
-        let _ = st.save(&repo.common_dir);
         log.errorf(&format!("setup failed: {e}"));
         return Ok(1);
     }
 
-    if let Some(a) = st.allocations.get_mut(&wt_name) {
-        a.status = "active".to_string();
-    }
-    if let Err(e) = st.save(&repo.common_dir) {
+    if let Err(e) = update_status(store, &wt_name, generation_id, "active") {
         log.errorf(&format!("state save failed: {e}"));
         return Ok(1);
     }
+    *st = store.read()?;
 
     if opts.emit_cd {
         println!("cd {}", sh_quote(&wt_path.to_string_lossy()));
@@ -136,11 +198,26 @@ pub fn cmd_new(
 pub fn setup_existing_worktree(
     log: &ui::Logger,
     repo: &gitx::Repo,
+    store: &StateStore,
     state: &mut State,
-    allocation_name: &str,
-    wt_path: &Path,
+    expected_allocation: &Allocation,
+    project: Option<&ProjectConfig>,
     modes: SetupModes<'_>,
 ) -> Result<()> {
+    let allocation_name = expected_allocation.name.as_str();
+    let generation_id = expected_allocation.generation_id;
+    let wt_path = Path::new(&expected_allocation.path);
+    let _lifecycle = store.lock_allocation(allocation_name)?;
+    *state = store.read()?;
+    let mut allocation = state
+        .allocations
+        .get(allocation_name)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("missing allocation: {allocation_name}"))?;
+    if allocation.generation_id != generation_id {
+        anyhow::bail!("allocation {allocation_name:?} was replaced before setup started");
+    }
+
     match worktree::copy_repo_env(&repo.root, wt_path) {
         Ok(true) => log.infof("copied .env from command worktree"),
         Ok(false) => {}
@@ -152,14 +229,36 @@ pub fn setup_existing_worktree(
         Err(e) => log.infof(&format!("copy .wrt.json failed: {e}")),
     }
 
+    let plan = project
+        .and_then(|config| config.commands().setup())
+        .map(SetupPlan::ProjectCommand)
+        .unwrap_or(SetupPlan::LegacySetup(modes));
+    if let SetupPlan::ProjectCommand(command) = plan {
+        let environment =
+            envx::ResolvedEnvironment::build_before_setup(repo, state, &allocation, project)?;
+        if let Some(project) = project
+            && let Some(report) = compose::inspect(repo, state, &allocation, project, &environment)?
+            && !report.is_safe()
+        {
+            anyhow::bail!(
+                "Compose isolation preflight failed:\n{}\nfix Compose config errors, parameterize published host ports, and remove fixed container_name values",
+                compose::format_findings(&report)
+            );
+        }
+        envx::sync_env_files(state, wt_path, &allocation, &environment)
+            .map_err(|error| anyhow::anyhow!("write env files: {error}"))?;
+        let code = run_project_command(state, wt_path, &allocation, &environment, command)?;
+        if code != 0 {
+            anyhow::bail!("project setup command exited with status {code}");
+        }
+        return Ok(());
+    }
+
+    let SetupPlan::LegacySetup(modes) = plan else {
+        unreachable!();
+    };
     let install = modes.install_mode.trim().to_lowercase();
     let db_mode = modes.db_mode.trim().to_lowercase();
-
-    let mut allocation = state
-        .allocations
-        .get(allocation_name)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("missing allocation: {allocation_name}"))?;
     let allocation_target = supabase::allocation_target(state, &allocation)?;
     if let Some((_, target)) = allocation_target.as_ref() {
         if !supabase::has_config(wt_path, target) {
@@ -178,9 +277,13 @@ pub fn setup_existing_worktree(
         let target = supabase::Target::from_config_path(config_path)?;
         if !state.is_primary_allocation(&allocation) {
             log.infof("supabase detected: patching config for isolation (project_id + ports)");
-            if let Err(e) =
-                supabase::patch_config(wt_path, &target, &allocation.name, allocation.offset)
-            {
+            if let Err(e) = supabase::patch_config_to_claims(
+                wt_path,
+                &target,
+                &allocation.name,
+                allocation.offset,
+                &allocation.ports,
+            ) {
                 anyhow::bail!("supabase patch failed: {e}");
             }
             let config_path = target.config_path_string();
@@ -191,15 +294,30 @@ pub fn setup_existing_worktree(
             );
         }
         let project_id = supabase::project_id(wt_path, &target)?;
-        allocation.supabase = SupabaseAllocation::Owned {
-            project_id,
-            config_path: target.config_path_string(),
-        };
-        state
+        let config_path = target.config_path_string();
+        store.update(|latest| {
+            let allocation = latest.allocation_mut_if_generation(allocation_name, generation_id)?;
+            allocation.supabase = SupabaseAllocation::Owned {
+                project_id,
+                config_path,
+            };
+            Ok(())
+        })?;
+        *state = store.read()?;
+        allocation = state
             .allocations
-            .insert(allocation_name.to_string(), allocation.clone());
-        state.save(&repo.common_dir)?;
+            .get(allocation_name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("allocation {allocation_name:?} no longer exists"))?;
+        if allocation.generation_id != generation_id {
+            anyhow::bail!("allocation {allocation_name:?} was replaced during setup");
+        }
     }
+
+    let environment =
+        envx::ResolvedEnvironment::build_before_setup(repo, state, &allocation, project)?;
+    envx::sync_env_files(state, wt_path, &allocation, &environment)
+        .map_err(|e| anyhow::anyhow!("write env files: {e}"))?;
 
     if install == "true" || (install == "auto" && pm::has_project(wt_path)) {
         if let Some((cmd, args)) = pm::detect_install_command(wt_path) {
@@ -226,15 +344,21 @@ pub fn setup_existing_worktree(
         let owner_path = owner.path.clone();
         supabase::ensure_started(Path::new(&owner_path), &target)?;
         if owner_is_primary && owner.path != allocation.path {
-            envx::sync_env_files(repo, state, Path::new(&owner_path), &owner)?;
+            let owner_project = ProjectConfig::load_for(&repo.config_root, Path::new(&owner_path))?;
+            let owner_environment =
+                envx::ResolvedEnvironment::build(repo, state, &owner, owner_project.as_ref())?;
+            envx::sync_env_files(state, Path::new(&owner_path), &owner, &owner_environment)?;
         }
     }
 
-    envx::sync_env_files(repo, state, wt_path, &allocation)
+    let environment = envx::ResolvedEnvironment::build(repo, state, &allocation, project)?;
+    envx::sync_env_files(state, wt_path, &allocation, &environment)
         .map_err(|e| anyhow::anyhow!("write env files: {e}"))?;
 
     if db_mode != "false" {
-        if let Err(e) = maybe_run_db_setup(log, repo, state, &allocation, wt_path, &db_mode) {
+        if let Err(e) =
+            maybe_run_db_setup(log, repo, state, &allocation, wt_path, project, &db_mode)
+        {
             anyhow::bail!("db setup failed: {e}");
         }
     }
@@ -248,6 +372,7 @@ fn maybe_run_db_setup(
     state: &State,
     alloc: &Allocation,
     wt_path: &Path,
+    project: Option<&ProjectConfig>,
     db_mode: &str,
 ) -> Result<()> {
     if db_mode == "auto" && matches!(alloc.supabase, SupabaseAllocation::Shared { .. }) {
@@ -257,16 +382,12 @@ fn maybe_run_db_setup(
 
     let resolved_target = supabase::allocation_target(state, alloc)?;
     let target = resolved_target.as_ref().map(|(_, target)| target.clone());
-    let (kind_hint, reset_cmd) = db::command(&repo.config_root, wt_path, target.as_ref(), "reset");
+    let (kind_hint, reset_cmd) = db::command(project, wt_path, target.as_ref(), "reset");
 
     let Some(argv) = reset_cmd else {
         log.infof("no reset command known; run `wrt init` to generate .wrt.json");
         return Ok(());
     };
-
-    if argv.is_empty() {
-        return Ok(());
-    }
 
     let label = kind_hint.as_deref().unwrap_or("database");
     let cmd_str = argv.join(" ");
@@ -282,7 +403,7 @@ fn maybe_run_db_setup(
                 log.infof("supabase: explicitly resetting the shared main database");
             }
             log.infof(&format!("{label}: running db setup: {cmd_str}"));
-            let code = run_argv_with_wrt_env(repo, state, &command_dir, alloc, &argv)?;
+            let code = run_argv_with_wrt_env(repo, state, &command_dir, alloc, project, &argv)?;
             if code != 0 {
                 anyhow::bail!("command failed");
             }
@@ -303,7 +424,7 @@ fn maybe_run_db_setup(
             }
 
             log.infof(&format!("{label}: running db setup: {cmd_str}"));
-            let code = run_argv_with_wrt_env(repo, state, &command_dir, alloc, &argv)?;
+            let code = run_argv_with_wrt_env(repo, state, &command_dir, alloc, project, &argv)?;
             if code != 0 {
                 anyhow::bail!("command failed");
             }
@@ -320,13 +441,18 @@ fn maybe_run_db_setup(
 fn resolve_feature_supabase(
     log: &ui::Logger,
     repo: &gitx::Repo,
+    store: &StateStore,
     state: &mut State,
     wt_path: &Path,
+    project: Option<&ProjectConfig>,
     opts: &NewOpts<'_>,
 ) -> Result<SupabaseAllocation> {
+    let start_supabase = project
+        .and_then(|config| config.commands().setup())
+        .is_none();
     let mode = match opts.sb_mode {
         FeatureSupabaseMode::Auto => {
-            if !ensure_main_supabase(log, repo, state, false)? {
+            if !ensure_main_supabase(log, repo, store, state, false, start_supabase)? {
                 ResolvedSupabaseMode::None
             } else if std::io::stdin().is_terminal()
                 && confirm("Create a per-feature Supabase database? No reuses main. (y/N): ")?
@@ -337,7 +463,7 @@ fn resolve_feature_supabase(
             }
         }
         FeatureSupabaseMode::Shared => {
-            if !ensure_main_supabase(log, repo, state, true)? {
+            if !ensure_main_supabase(log, repo, store, state, true, start_supabase)? {
                 anyhow::bail!("main worktree has no Supabase config to share");
             }
             ResolvedSupabaseMode::Shared
@@ -353,8 +479,8 @@ fn resolve_feature_supabase(
                     .root
                     .as_ref()
                     .and_then(|root| root.supabase_config_path.as_deref());
-                let explicit = supabase::resolve_target(wt_path, Some(explicit), None)?;
-                let stored = supabase::resolve_target(wt_path, None, root_path)?;
+                let explicit = supabase::resolve_target(Some(explicit), None, project)?;
+                let stored = supabase::resolve_target(None, root_path, project)?;
                 if explicit != stored {
                     anyhow::bail!(
                         "--supabase-config cannot override the main config in shared mode"
@@ -373,7 +499,7 @@ fn resolve_feature_supabase(
                 .root
                 .as_ref()
                 .and_then(|root| root.supabase_config_path.as_deref());
-            let target = supabase::resolve_target(wt_path, opts.supabase_config, stored)?;
+            let target = supabase::resolve_target(opts.supabase_config, stored, project)?;
             if !supabase::has_config(wt_path, &target) {
                 anyhow::bail!(
                     "supabase config not found: {}",
@@ -392,13 +518,16 @@ fn resolve_feature_supabase(
 fn ensure_main_supabase(
     log: &ui::Logger,
     repo: &gitx::Repo,
+    store: &StateStore,
     state: &mut State,
     allow_disabled: bool,
+    start_stack: bool,
 ) -> Result<bool> {
     let Some(primary_key) = state.primary_allocation_key().map(str::to_string) else {
         return Ok(false);
     };
     let primary = state.allocations[&primary_key].clone();
+    let primary_generation = primary.generation_id;
     match primary.supabase {
         SupabaseAllocation::Owned { .. } => return Ok(true),
         SupabaseAllocation::None if !allow_disabled => return Ok(false),
@@ -413,29 +542,231 @@ fn ensure_main_supabase(
         .as_ref()
         .and_then(|root| root.supabase_config_path.as_deref());
     let main_path = Path::new(&primary.path);
-    let discovery_root = if repo.config_root.join(".wrt.json").is_file() {
-        repo.config_root.as_path()
-    } else {
-        main_path
-    };
-    let target = supabase::resolve_target(discovery_root, None, stored)?;
+    let project = ProjectConfig::load_for(&repo.config_root, main_path)?;
+    let target = supabase::resolve_target(None, stored, project.as_ref())?;
     if !supabase::has_config(main_path, &target) {
         return Ok(false);
     }
     let project_id = supabase::project_id(main_path, &target)?;
-    if let Some(root) = state.root.as_mut() {
-        root.supabase_config_path = Some(target.config_path_string());
-    }
-    if let Some(primary) = state.allocations.get_mut(&primary_key) {
+    let config_path = target.config_path_string();
+    let claims = supabase::port_claims(main_path, &target, 0)?;
+    let established = store.update(|latest| {
+        if let Some(stored) = latest
+            .root
+            .as_ref()
+            .and_then(|root| root.supabase_config_path.as_deref())
+            && stored != config_path
+        {
+            anyhow::bail!(
+                "main Supabase target changed while ownership was being established: {stored:?} != {config_path:?}"
+            );
+        }
+        let primary = latest.allocation_mut_if_generation(&primary_key, primary_generation)?;
+        match &primary.supabase {
+            SupabaseAllocation::Owned {
+                project_id: existing_project_id,
+                config_path: existing_config_path,
+            } => {
+                if existing_project_id != &project_id
+                    || existing_config_path != &config_path
+                    || !supabase_claims_match(&primary.ports, &claims)
+                {
+                    anyhow::bail!(
+                        "main Supabase ownership changed while it was being established"
+                    );
+                }
+                return Ok(false);
+            }
+            SupabaseAllocation::Shared { .. } => {
+                anyhow::bail!("main worktree cannot share another Supabase stack");
+            }
+            SupabaseAllocation::None => {}
+        }
+        merge_port_assignments(&mut primary.ports, claims)?;
         primary.supabase = SupabaseAllocation::Owned {
             project_id,
-            config_path: target.config_path_string(),
+            config_path: config_path.clone(),
         };
+        if let Some(root) = latest.root.as_mut() {
+            root.supabase_config_path = Some(config_path);
+        }
+        Ok(true)
+    })?;
+    *state = store.read()?;
+    if established {
+        log.infof("supabase: establishing shared main stack");
     }
-    state.save(&repo.common_dir)?;
-    log.infof("supabase: establishing shared main stack");
-    supabase::ensure_started(main_path, &target)?;
     let primary = state.allocations[&primary_key].clone();
-    envx::sync_env_files(repo, state, main_path, &primary)?;
+    let environment =
+        envx::ResolvedEnvironment::build_before_setup(repo, state, &primary, project.as_ref())?;
+    envx::sync_env_files(state, main_path, &primary, &environment)?;
+    if !start_stack {
+        return Ok(true);
+    }
+    supabase::ensure_started(main_path, &target)?;
+    let environment = envx::ResolvedEnvironment::build(repo, state, &primary, project.as_ref())?;
+    envx::sync_env_files(state, main_path, &primary, &environment)?;
     Ok(true)
+}
+
+fn isolated_supabase_port_claims(
+    worktree_path: &Path,
+    allocation: &SupabaseAllocation,
+) -> Result<PortAssignments> {
+    match allocation {
+        SupabaseAllocation::Owned { config_path, .. } => {
+            let target = supabase::Target::from_config_path(config_path)?;
+            supabase::port_claims(worktree_path, &target, 0)
+        }
+        SupabaseAllocation::None | SupabaseAllocation::Shared { .. } => Ok(PortAssignments::new()),
+    }
+}
+
+fn remove_failed_worktree(log: &ui::Logger, repo: &gitx::Repo, worktree_path: &Path) {
+    if let Err(error) = worktree::remove(&repo.common_dir, worktree_path, true) {
+        log.errorf(&format!(
+            "cleanup failed: remove worktree {}: {error:#}",
+            worktree_path.display()
+        ));
+    }
+}
+
+fn clear_failed_reservation(
+    store: &StateStore,
+    allocation_name: &str,
+    generation_id: AllocationGeneration,
+) -> Result<()> {
+    let current = store.read()?;
+    let Some(allocation) = current.allocations.get(allocation_name) else {
+        return Ok(());
+    };
+    if allocation.generation_id != generation_id {
+        anyhow::bail!("allocation {allocation_name:?} belongs to another creation operation");
+    }
+
+    let removal = store.update(|state| match state.allocations.get(allocation_name) {
+        None => Ok(()),
+        Some(allocation) if allocation.generation_id == generation_id => {
+            state.remove_if_generation(allocation_name, generation_id)?;
+            Ok(())
+        }
+        Some(_) => {
+            anyhow::bail!("allocation {allocation_name:?} was replaced during reservation cleanup")
+        }
+    });
+    let Err(removal_error) = removal else {
+        return Ok(());
+    };
+
+    let current = store.read().map_err(|read_error| {
+        anyhow::anyhow!(
+            "remove persisted reservation: {removal_error:#}; reload state: {read_error:#}"
+        )
+    })?;
+    match current.allocations.get(allocation_name) {
+        None => Ok(()),
+        Some(allocation) if allocation.generation_id == generation_id => Err(anyhow::anyhow!(
+            "allocation {allocation_name:?} remains reserved: {removal_error:#}"
+        )),
+        Some(_) => {
+            anyhow::bail!("allocation {allocation_name:?} was replaced during reservation cleanup")
+        }
+    }
+}
+
+fn supabase_claims_match(existing: &PortAssignments, expected: &PortAssignments) -> bool {
+    let mut existing_claims = existing
+        .iter()
+        .filter(|(key, _)| key.as_str().starts_with("supabase."));
+    existing_claims.clone().count() == expected.len()
+        && existing_claims.all(|(key, port)| expected.get(key) == Some(port))
+}
+
+pub(crate) fn update_status(
+    store: &StateStore,
+    allocation_name: &str,
+    generation_id: AllocationGeneration,
+    status: &str,
+) -> Result<()> {
+    store.update(|state| {
+        let allocation = state.allocation_mut_if_generation(allocation_name, generation_id)?;
+        allocation.status = status.to_string();
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn repo(root: &Path) -> gitx::Repo {
+        gitx::Repo::new(
+            root.to_path_buf(),
+            root.join(".git"),
+            root.join("main"),
+            root.to_path_buf(),
+            Some(root.join("main")),
+        )
+    }
+
+    fn allocation(generation_id: AllocationGeneration) -> Allocation {
+        Allocation {
+            generation_id,
+            name: "feature".to_string(),
+            branch: "feature".to_string(),
+            path: "/tmp/feature".to_string(),
+            block: 1,
+            offset: 100,
+            ports: PortAssignments::new(),
+            status: "creating".to_string(),
+            created_at: "now".to_string(),
+            supabase: SupabaseAllocation::None,
+            setup: AllocationSetup::default(),
+        }
+    }
+
+    #[test]
+    fn failed_reservation_cleanup_removes_only_its_generation() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = StateStore::new(&repo(temp.path()));
+        let expected = AllocationGeneration::new();
+        store
+            .update(|state| {
+                state
+                    .allocations
+                    .insert("feature".to_string(), allocation(expected));
+                Ok(())
+            })
+            .unwrap();
+
+        clear_failed_reservation(&store, "feature", expected).unwrap();
+
+        assert!(!store.read().unwrap().allocations.contains_key("feature"));
+    }
+
+    #[test]
+    fn failed_reservation_cleanup_keeps_a_replacement_generation() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = StateStore::new(&repo(temp.path()));
+        let stale = AllocationGeneration::new();
+        let replacement = AllocationGeneration::new();
+        store
+            .update(|state| {
+                state
+                    .allocations
+                    .insert("feature".to_string(), allocation(replacement));
+                Ok(())
+            })
+            .unwrap();
+
+        let error = clear_failed_reservation(&store, "feature", stale)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("another creation operation"), "{error}");
+        assert_eq!(
+            store.read().unwrap().allocations["feature"].generation_id,
+            replacement
+        );
+    }
 }

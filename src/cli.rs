@@ -13,6 +13,8 @@ Usage:
   wrt ls
   wrt path <name>
   wrt env [<name>]
+  wrt doctor [<name>]
+  wrt setup <name>
   wrt rm <name> [--force] [--delete-branch]
   wrt remove <name> [--force] [--delete-branch]
   wrt prune
@@ -133,6 +135,12 @@ pub enum Cmd {
 
     /// Print exports for the current worktree (or pass a name)
     Env { name: Option<String> },
+
+    /// Check whether Compose can isolate two worktree allocations
+    Doctor { name: Option<String> },
+
+    /// Retry setup for an existing worktree without changing its allocation
+    Setup { name: String },
 
     /// Remove a worktree
     #[command(visible_alias = "remove")]

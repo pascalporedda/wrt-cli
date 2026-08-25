@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use crate::cli::DbAction;
 use crate::db;
 use crate::gitx;
+use crate::project::ProjectConfig;
 use crate::state::State;
 use crate::state::SupabaseAllocation;
 use crate::supabase;
@@ -48,7 +49,8 @@ pub fn cmd_db(
     };
     let resolved_target = supabase::allocation_target(st, a)?;
     let target = resolved_target.as_ref().map(|(_, target)| target.clone());
-    let (kind_hint, cmd) = db::command(&repo.config_root, &wt_path, target.as_ref(), op);
+    let project = ProjectConfig::load_for(&repo.config_root, &wt_path)?;
+    let (kind_hint, cmd) = db::command(project.as_ref(), &wt_path, target.as_ref(), op);
 
     let Some(argv) = cmd else {
         let label = kind_hint.as_deref().unwrap_or("database");
@@ -57,10 +59,6 @@ pub fn cmd_db(
         ));
         return Ok(2);
     };
-    if argv.is_empty() {
-        return Ok(0);
-    }
-
     let label = kind_hint.as_deref().unwrap_or("database");
     let cmd_str = argv.join(" ");
 
@@ -75,10 +73,8 @@ pub fn cmd_db(
         return Ok(0);
     }
 
-    if op == "reset" {
-        if yes {
-            // ok
-        } else if !std::io::stdin().is_terminal() {
+    if op == "reset" && !yes {
+        if !std::io::stdin().is_terminal() {
             log.errorf(&format!(
                 "{label}: refusing to run reset non-interactively; pass `--yes` to confirm"
             ));
@@ -97,5 +93,5 @@ pub fn cmd_db(
     } else {
         wt_path
     };
-    run_argv_with_wrt_env(repo, st, &command_dir, a, &argv)
+    run_argv_with_wrt_env(repo, st, &command_dir, a, project.as_ref(), &argv)
 }

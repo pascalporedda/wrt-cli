@@ -1,7 +1,9 @@
 use anyhow::Result;
+use std::path::Path;
 
 use crate::envx;
 use crate::gitx;
+use crate::project::ProjectConfig;
 use crate::state::State;
 use crate::ui;
 use crate::util::infer_worktree_from_cwd;
@@ -35,6 +37,8 @@ pub fn cmd_env(log: &ui::Logger, repo: &gitx::Repo, st: &State, name: Option<&st
         return Ok(2);
     };
 
-    envx::print_exports(repo, st, a)?;
+    let project = ProjectConfig::load_for(&repo.config_root, Path::new(&a.path))?;
+    let environment = envx::ResolvedEnvironment::build(repo, st, a, project.as_ref())?;
+    envx::print_exports(&environment);
     Ok(0)
 }

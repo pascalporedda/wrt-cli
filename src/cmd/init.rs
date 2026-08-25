@@ -4,6 +4,7 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::codex;
+use crate::project::ProjectConfig;
 use crate::ui;
 
 pub fn cmd_init(
@@ -31,7 +32,7 @@ pub fn cmd_init(
     if let Some(model) = model {
         opts.model = model;
     }
-    let (raw, _) = match codex::discover(opts) {
+    let raw = match codex::discover(opts) {
         Ok(v) => v,
         Err(e) => {
             log.errorf(&format!("{e}"));
@@ -39,6 +40,18 @@ pub fn cmd_init(
             return Ok(1);
         }
     };
+
+    let config = match ProjectConfig::from_slice(&raw) {
+        Ok(config) => config,
+        Err(error) => {
+            log.errorf(&format!("invalid project config from Codex: {error:#}"));
+            return Ok(1);
+        }
+    };
+    if let Err(error) = config.validate_discovery_paths(discovery_root) {
+        log.errorf(&format!("invalid project config from Codex: {error:#}"));
+        return Ok(1);
+    }
 
     let v: serde_json::Value = match serde_json::from_slice(&raw) {
         Ok(v) => v,

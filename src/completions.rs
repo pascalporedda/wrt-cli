@@ -15,6 +15,8 @@ mod tests {
         assert!(script.contains("'1:worktree:_wrt_worktrees'"));
         assert!(script.contains("$1 != \"(no\""));
         assert!(script.contains("'1:name:_wrt_branches'"));
+        assert!(script.contains("path|setup)"));
+        assert!(script.contains("env|doctor)"));
         assert!(script.contains("refs/heads refs/remotes"));
         assert!(script.contains("sub(\"^refs/remotes/[^/]+/\", \"\", name)"));
     }

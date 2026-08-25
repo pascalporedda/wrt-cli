@@ -32,6 +32,8 @@ _wrt() {
         'ls[List tracked worktrees]' \
         'path[Print worktree path]' \
         'env[Print exports for a worktree]' \
+        'doctor[Check Compose worktree isolation]' \
+        'setup[Retry setup for a worktree]' \
         'rm[Remove a worktree]' \
         'remove[Remove a worktree]' \
         'prune[Prune git worktrees and state]' \
@@ -49,11 +51,11 @@ _wrt() {
             '--delete-branch[Delete branch]'
           return
           ;;
-        path)
+        path|setup)
           _arguments '1:worktree:_wrt_worktrees'
           return
           ;;
-        env)
+        env|doctor)
           _arguments '1::worktree:_wrt_worktrees'
           return
           ;;

@@ -7,10 +7,12 @@ mod cli;
 mod cmd;
 mod codex;
 mod completions;
+mod compose;
 mod db;
 mod envx;
 mod gitx;
 mod pm;
+mod project;
 mod state;
 mod supabase;
 mod ui;
@@ -19,9 +21,9 @@ mod worktree;
 
 use cli::{Cli, Cmd, RootAction, USAGE_TEXT};
 use cmd::{
-    CloneOpts, NewOpts, RootInitOpts, cmd_clone, cmd_db, cmd_env, cmd_housekeeping, cmd_init,
-    cmd_ls, cmd_new, cmd_path, cmd_prune, cmd_rm, cmd_root_init, cmd_root_status, cmd_run,
-    raw_run_has_sep,
+    CloneOpts, NewOpts, RootInitOpts, cmd_clone, cmd_db, cmd_doctor, cmd_env, cmd_housekeeping,
+    cmd_init, cmd_ls, cmd_new, cmd_path, cmd_prune, cmd_rm, cmd_root_init, cmd_root_status,
+    cmd_run, cmd_setup, raw_run_has_sep,
 };
 
 fn main() -> ExitCode {
@@ -119,7 +121,8 @@ fn run() -> Result<i32> {
         &[".env", ".env.local", ".wrt.env", ".wrt.json"],
     );
 
-    let mut st = match state::State::load(&repo.common_dir) {
+    let store = state::StateStore::new(&repo);
+    let mut st = match store.read() {
         Ok(s) => s,
         Err(e) => {
             log.errorf(&format!("state load failed: {e}"));
@@ -169,7 +172,7 @@ fn run() -> Result<i32> {
                 db_mode: &db,
                 emit_cd: cd,
             };
-            cmd_new(&log, &repo, &mut st, opts)
+            cmd_new(&log, &repo, &store, &mut st, opts)
         }
 
         Cmd::Db {
@@ -191,13 +194,17 @@ fn run() -> Result<i32> {
 
         Cmd::Env { name } => cmd_env(&log, &repo, &st, name.as_deref()),
 
+        Cmd::Doctor { name } => cmd_doctor(&log, &repo, &st, name.as_deref()),
+
+        Cmd::Setup { name } => cmd_setup(&log, &repo, &store, &mut st, &name),
+
         Cmd::Rm {
             name,
             force,
             delete_branch,
-        } => cmd_rm(&log, &repo, &mut st, &name, force, delete_branch),
+        } => cmd_rm(&log, &repo, &store, &mut st, &name, force, delete_branch),
 
-        Cmd::Prune => cmd_prune(&log, &repo, &mut st),
+        Cmd::Prune => cmd_prune(&log, &repo, &store, &mut st),
 
         Cmd::Housekeeping { apply } => cmd_housekeeping(&log, &repo, apply),
 

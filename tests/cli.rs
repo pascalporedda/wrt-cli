@@ -167,6 +167,40 @@ fn set_minimal_path(cmd: &mut assert_cmd::Command) {
     cmd.env("PATH", "/usr/bin:/bin");
 }
 
+fn complete_v2_config(input: &str) -> Vec<u8> {
+    let mut value: serde_json::Value = serde_json::from_str(input).unwrap();
+    let root = value.as_object_mut().unwrap();
+    root.entry("ports").or_insert_with(|| serde_json::json!([]));
+    for port in root["ports"].as_array_mut().unwrap() {
+        port.as_object_mut()
+            .unwrap()
+            .entry("outputs")
+            .or_insert_with(|| serde_json::json!([]));
+    }
+    let commands = root
+        .entry("commands")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .unwrap();
+    for name in [
+        "setup",
+        "start",
+        "stop",
+        "status",
+        "db_migrate",
+        "db_seed",
+        "db_reset",
+    ] {
+        let command = commands.entry(name).or_insert(serde_json::Value::Null);
+        if let Some(command) = command.as_object_mut() {
+            command.entry("cwd").or_insert(serde_json::Value::Null);
+        }
+    }
+    root.entry("compose").or_insert(serde_json::Value::Null);
+    root.entry("supabase").or_insert(serde_json::Value::Null);
+    serde_json::to_vec(&value).unwrap()
+}
+
 #[cfg(unix)]
 fn write_mock_bin(dir: &Path, name: &str, body: &str) {
     use std::os::unix::fs::PermissionsExt;
@@ -190,11 +224,103 @@ case "$1" in
     test -f .mock_supabase_started || exit 1
     printf '{"API_URL":"http://127.0.0.1:54321","DB_URL":"postgresql://postgres:postgres@127.0.0.1:54322/postgres","ANON_KEY":"anon","SERVICE_ROLE_KEY":"service","JWT_SECRET":"jwt","STUDIO_URL":"http://127.0.0.1:54323"}\n'
     ;;
-  start) touch .mock_supabase_started ;;
+  start)
+    if [ -n "${EXPECT_WRT_ENV:-}" ]; then test -f "$EXPECT_WRT_ENV" || exit 31; fi
+    touch .mock_supabase_started
+    ;;
   stop) rm -f .mock_supabase_started ;;
 esac
 "#,
     );
+}
+
+#[cfg(unix)]
+fn write_mock_docker(dir: &Path) {
+    write_mock_bin(
+        dir,
+        "docker",
+        r#"#!/bin/sh
+set -eu
+if [ "${MOCK_DOCKER_MODE:-safe}" = fail ]; then
+  printf 'mock render failed\n' >&2
+  exit 19
+fi
+if [ "${MOCK_DOCKER_MODE:-safe}" = blocked ]; then
+  printf '{"services":{"postgres":{"container_name":"eln-postgres","ports":[{"target":5432,"published":"5432","protocol":"tcp"}]},"redis":{"ports":[{"target":6379,"published":"%s","protocol":"tcp"}]}}}\n' "$REDIS_PORT"
+  exit 0
+fi
+printf '{"services":{"redis":{"ports":[{"protocol":"tcp","published":"%s","target":6379}]},"postgres":{"ports":[{"protocol":"tcp","published":"%s","target":5432}]}}}\n' "$REDIS_PORT" "$POSTGRES_PORT"
+"#,
+    );
+}
+
+#[cfg(unix)]
+fn compose_source() -> TempDir {
+    let source = init_repo();
+    fs::write(
+        source.path().join(".wrt.json"),
+        complete_v2_config(
+            r#"{
+  "version":2,
+  "port_stride":100,
+  "ports":[
+    {"key":"postgres","base_port":5432,"outputs":[{"env":"POSTGRES_PORT","template":"{port}"}]},
+    {"key":"redis","base_port":6379,"outputs":[{"env":"REDIS_PORT","template":"{port}"}]}
+  ],
+  "commands":{"setup":{"argv":["sh","setup.sh"]}},
+  "compose":{"files":["compose.yaml"]}
+}"#,
+        ),
+    )
+    .unwrap();
+    fs::write(
+        source.path().join("compose.yaml"),
+        "services:\n  postgres:\n    image: postgres\n    ports:\n      - \"${POSTGRES_PORT}:5432\"\n  redis:\n    image: redis\n    ports:\n      - \"${REDIS_PORT}:6379\"\n",
+    )
+    .unwrap();
+    fs::write(
+        source.path().join("setup.sh"),
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$WRT_NAME\" >> \"$WRT_WORKTREE_PATH/setup.log\"\n",
+    )
+    .unwrap();
+    git(source.path(), &["add", "."]);
+    git(
+        source.path(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-m",
+            "add compose project",
+        ],
+    );
+    source
+}
+
+#[cfg(unix)]
+fn init_compose_managed(source: &TempDir, docker_bin: &Path) -> TempDir {
+    let root = TempDir::new().unwrap();
+    wrt_cmd()
+        .current_dir(source.path())
+        .env("PATH", format!("{}:/usr/bin:/bin", docker_bin.display()))
+        .args([
+            "root",
+            "init",
+            source.path().to_str().unwrap(),
+            "--root",
+            root.path().to_str().unwrap(),
+            "--install",
+            "false",
+            "--supabase",
+            "false",
+            "--db",
+            "false",
+        ])
+        .assert()
+        .success();
+    root
 }
 
 #[test]
@@ -219,6 +345,177 @@ fn commands_require_managed_root() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains("not a wrt managed root"));
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_reports_safe_and_blocked_compose_renders() {
+    let source = compose_source();
+    let bin = TempDir::new().unwrap();
+    write_mock_docker(bin.path());
+    let managed = init_compose_managed(&source, bin.path());
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+    let state_path = managed.path().join(".git/.wrt/state.json");
+    let state_before = fs::read(&state_path).unwrap();
+
+    wrt_cmd()
+        .current_dir(main_path(&managed))
+        .env("PATH", &path)
+        .arg("doctor")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "main: Compose isolation check passed",
+        ));
+
+    wrt_cmd()
+        .current_dir(managed.path())
+        .env("PATH", &path)
+        .env("MOCK_DOCKER_MODE", "blocked")
+        .args(["doctor", "main"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("fixed-host-port"))
+        .stderr(predicate::str::contains("service=postgres"))
+        .stderr(predicate::str::contains("5432"))
+        .stderr(predicate::str::contains("fixed-container-name"))
+        .stderr(predicate::str::contains("eln-postgres"));
+
+    assert_eq!(fs::read(state_path).unwrap(), state_before);
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_render_failure_and_automatic_setup_are_blocking() {
+    let source = compose_source();
+    let bin = TempDir::new().unwrap();
+    write_mock_docker(bin.path());
+    let managed = init_compose_managed(&source, bin.path());
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+
+    wrt_cmd()
+        .current_dir(managed.path())
+        .env("PATH", &path)
+        .env("MOCK_DOCKER_MODE", "fail")
+        .args(["doctor", "main"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("render-failed"))
+        .stderr(predicate::str::contains("exit status: 19"))
+        .stderr(predicate::str::contains("mock render failed").not());
+
+    wrt_cmd()
+        .current_dir(managed.path())
+        .env("PATH", &path)
+        .env("MOCK_DOCKER_MODE", "blocked")
+        .args([
+            "new",
+            "blocked-feature",
+            "--install",
+            "false",
+            "--supabase",
+            "none",
+            "--db",
+            "false",
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "Compose isolation preflight failed",
+        ));
+
+    assert!(
+        !worktree_path(&managed, "blocked-feature")
+            .join("setup.log")
+            .exists()
+    );
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(managed.path().join(".git/.wrt/state.json")).unwrap())
+            .unwrap();
+    assert_eq!(state["allocations"]["blocked-feature"]["status"], "failed");
+}
+
+#[cfg(unix)]
+#[test]
+fn compose_config_without_project_setup_keeps_the_legacy_path_out_of_preflight() {
+    let source = init_repo();
+    fs::write(
+        source.path().join(".wrt.json"),
+        complete_v2_config(
+            r#"{
+  "version":2,
+  "port_stride":100,
+  "commands":{"setup":null},
+  "compose":{"files":["compose.yaml"]}
+}"#,
+        ),
+    )
+    .unwrap();
+    fs::write(
+        source.path().join("compose.yaml"),
+        "services:\n  api:\n    image: busybox\n    ports:\n      - \"9000:80\"\n",
+    )
+    .unwrap();
+    git(source.path(), &["add", "."]);
+    git(
+        source.path(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-m",
+            "add compose without project setup",
+        ],
+    );
+    let bin = TempDir::new().unwrap();
+    let docker_log = bin.path().join("docker.log");
+    write_mock_bin(
+        bin.path(),
+        "docker",
+        "#!/bin/sh\nprintf 'called\\n' >> \"$MOCK_LOG\"\nexit 99\n",
+    );
+    let managed = TempDir::new().unwrap();
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+    wrt_cmd()
+        .current_dir(source.path())
+        .env("PATH", &path)
+        .env("MOCK_LOG", &docker_log)
+        .args([
+            "root",
+            "init",
+            source.path().to_str().unwrap(),
+            "--root",
+            managed.path().to_str().unwrap(),
+            "--install",
+            "false",
+            "--supabase",
+            "false",
+            "--db",
+            "false",
+        ])
+        .assert()
+        .success();
+
+    wrt_cmd()
+        .current_dir(managed.path())
+        .env("PATH", &path)
+        .env("MOCK_LOG", &docker_log)
+        .args([
+            "new",
+            "legacy-compose",
+            "--install",
+            "false",
+            "--supabase",
+            "none",
+            "--db",
+            "false",
+        ])
+        .assert()
+        .success();
+
+    assert!(!docker_log.exists());
 }
 
 #[test]
@@ -310,35 +607,110 @@ fn init_writes_config_and_respects_force() {
 }
 
 #[test]
-fn env_reads_managed_root_config_when_checkout_has_none() {
+fn init_rejects_invalid_project_config_without_writing() {
     let (_source, td) = init_managed_repo();
     let main = main_path(&td);
-    assert!(!main.join(".wrt.json").exists());
-
+    let mock = td.path().join("invalid-mock.json");
     fs::write(
-        td.path().join(".wrt.json"),
-        r#"{
-  "version": 1,
-  "port_block_size": 100,
-  "package_manager": { "name": "unknown", "install_command": ["npm","install"], "notes": null },
-  "services": [{ "name": "web", "kind": "web", "dev_command": ["npm","run","dev"], "base_port": 3000, "port_env": "PORT", "url_env": "APP_URL", "notes": null }],
-  "database": { "detected": false, "kind": null, "migrate_command": null, "seed_command": null, "reset_command": null, "notes": null },
-  "supabase": { "detected": false, "config_path": null, "start_command": null, "base_ports": null, "notes": null },
-  "notes": null
-}
-"#,
+        &mock,
+        complete_v2_config(r#"{"version":2,"port_stride":100,"commands":{"setup":{"argv":[]}}}"#),
     )
     .unwrap();
+
+    wrt_cmd()
+        .current_dir(&main)
+        .env("WRT_CODEX_MOCK_OUTPUT", &mock)
+        .args(["init"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "invalid project config from Codex",
+        ))
+        .stderr(predicate::str::contains("setup argv must not be empty"));
+
+    assert!(!td.path().join(".wrt.json").exists());
+}
+
+#[test]
+fn invalid_checkout_config_does_not_fall_back_for_env() {
+    let (_source, td) = init_managed_repo();
+    let main = main_path(&td);
+    fs::write(
+        td.path().join(".wrt.json"),
+        r#"{"version":1,"port_block_size":100}"#,
+    )
+    .unwrap();
+    fs::write(main.join(".wrt.json"), "not json").unwrap();
+
+    wrt_cmd()
+        .current_dir(&main)
+        .args(["env", "main"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("invalid"))
+        .stderr(predicate::str::contains(".wrt.json"));
+}
+
+#[test]
+fn env_reads_managed_root_config_when_checkout_has_none() {
+    let source = init_repo();
+    fs::write(
+        source.path().join(".wrt.json"),
+        complete_v2_config(
+            r#"{
+  "version": 2,
+  "port_stride": 100,
+  "ports": [
+    {"key":"postgres","base_port":5432,"outputs":[{"env":"DATABASE_URL","template":"postgresql://postgres:postgres@localhost:{port}/eln"}]},
+    {"key":"redis","base_port":6379,"outputs":[{"env":"REDIS_URL","template":"redis://localhost:{port}"}]},
+    {"key":"rabbitmq","base_port":5672,"outputs":[{"env":"AMQP_URL","template":"amqp://localhost:{port}"}]},
+    {"key":"core-api","base_port":3000,"outputs":[{"env":"CORE_API_PORT","template":"{port}"},{"env":"CORE_API_URL","template":"http://localhost:{port}/api/v1"}]},
+    {"key":"oauth","base_port":8181,"outputs":[{"env":"OAUTH_CALLBACK_URL","template":"http://localhost:{port}/callback"}]}
+  ]
+}
+"#,
+        ),
+    )
+    .unwrap();
+    git(source.path(), &["add", ".wrt.json"]);
+    git(
+        source.path(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-m",
+            "add wrt config",
+        ],
+    );
+    let (_source, td) = init_managed_from(source);
+    let main = main_path(&td);
+    fs::remove_file(main.join(".wrt.json")).unwrap();
 
     wrt_cmd()
         .current_dir(&main)
         .args(["env", "main"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("export PORT='3000'"))
         .stdout(predicate::str::contains(
-            "export APP_URL='http://localhost:3000'",
-        ));
+            "export DATABASE_URL='postgresql://postgres:postgres@localhost:5432/eln'",
+        ))
+        .stdout(predicate::str::contains(
+            "export REDIS_URL='redis://localhost:6379'",
+        ))
+        .stdout(predicate::str::contains(
+            "export AMQP_URL='amqp://localhost:5672'",
+        ))
+        .stdout(predicate::str::contains("export CORE_API_PORT='3000'"))
+        .stdout(predicate::str::contains(
+            "export CORE_API_URL='http://localhost:3000/api/v1'",
+        ))
+        .stdout(predicate::str::contains(
+            "export OAUTH_CALLBACK_URL='http://localhost:8181/callback'",
+        ))
+        .stdout(predicate::str::contains("export WRT_NAME='main'"));
 }
 
 #[cfg(unix)]
@@ -376,7 +748,7 @@ fn new_patches_supabase_and_sets_skip_worktree_when_isolated() {
 
     let mut cmd = wrt_cmd();
     cmd.current_dir(td.path())
-        .env("PATH", path)
+        .env("PATH", &path)
         .env("MOCK_LOG", log)
         .args([
             "new",
@@ -778,6 +1150,7 @@ fn new_runs_mocked_package_install_and_supabase_lifecycle() {
         .current_dir(td.path())
         .env("PATH", &path)
         .env("MOCK_LOG", &log)
+        .env("EXPECT_WRT_ENV", td.path().join("x/.wrt.env"))
         .args([
             "new",
             "x",
@@ -1229,6 +1602,457 @@ fn new_and_rm_roundtrip() {
         .success();
 
     assert!(!wt_dir.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn new_concurrent_processes_reserve_disjoint_port_sets() {
+    let source = init_repo();
+    fs::write(
+        source.path().join(".wrt.json"),
+        complete_v2_config(
+            r#"{"version":2,"port_stride":100,"ports":[{"key":"api","base_port":3000},{"key":"postgres","base_port":5432}]}"#,
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(source.path().join("supabase")).unwrap();
+    fs::write(
+        source.path().join("supabase/config.toml"),
+        "project_id = \"concurrent\"\n[api]\nport = 54321\n[db]\nport = 54322\n",
+    )
+    .unwrap();
+    git(source.path(), &["add", ".wrt.json", "supabase/config.toml"]);
+    git(
+        source.path(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-m",
+            "add concurrent port config",
+        ],
+    );
+    let (_source, managed) = init_managed_from(source);
+    let bin = TempDir::new().unwrap();
+    let log = managed.path().join("supabase.log");
+    write_mock_supabase(bin.path());
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+    let binary = assert_cmd::cargo::cargo_bin!("wrt");
+
+    let spawn = |name: &str| {
+        StdCommand::new(binary)
+            .current_dir(managed.path())
+            .env("PATH", &path)
+            .env("MOCK_LOG", &log)
+            .args([
+                "new",
+                name,
+                "--install",
+                "false",
+                "--supabase",
+                "isolated",
+                "--db",
+                "false",
+            ])
+            .spawn()
+            .unwrap()
+    };
+    let first = spawn("concurrent-one");
+    let second = spawn("concurrent-two");
+
+    let first = first.wait_with_output().unwrap();
+    let second = second.wait_with_output().unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(managed.path().join(".git/.wrt/state.json")).unwrap())
+            .unwrap();
+    let port_set = |name: &str| {
+        state["allocations"][name]["ports"]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|value| value.as_u64().unwrap())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let first = port_set("concurrent-one");
+    let second = port_set("concurrent-two");
+    assert_eq!(first.len(), 4);
+    assert_eq!(second.len(), 4);
+    assert!(first.is_disjoint(&second));
+    for name in ["concurrent-one", "concurrent-two"] {
+        let ports = state["allocations"][name]["ports"].as_object().unwrap();
+        assert!(ports.contains_key("supabase.api.port"));
+        assert!(ports.contains_key("supabase.db.port"));
+    }
+    assert_eq!(state["allocations"].as_object().unwrap().len(), 3);
+}
+
+#[test]
+fn new_removes_checkout_after_config_or_reservation_failure() {
+    let (_source, managed) = init_managed_repo();
+
+    fs::write(managed.path().join(".wrt.json"), "not json").unwrap();
+    wrt_cmd()
+        .current_dir(managed.path())
+        .args([
+            "new",
+            "invalid-config",
+            "--install",
+            "false",
+            "--supabase",
+            "false",
+            "--db",
+            "false",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("project config failed"));
+    assert!(!worktree_path(&managed, "invalid-config").exists());
+
+    fs::write(
+        managed.path().join(".wrt.json"),
+        complete_v2_config(
+            r#"{"version":2,"port_stride":100,"ports":[{"key":"api","base_port":65500}]}"#,
+        ),
+    )
+    .unwrap();
+    wrt_cmd()
+        .current_dir(managed.path())
+        .args([
+            "new",
+            "invalid-reservation",
+            "--install",
+            "false",
+            "--supabase",
+            "false",
+            "--db",
+            "false",
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("reserve allocation failed"))
+        .stderr(predicate::str::contains("out of range"));
+    assert!(!worktree_path(&managed, "invalid-reservation").exists());
+
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(managed.path().join(".git/.wrt/state.json")).unwrap())
+            .unwrap();
+    assert!(state["allocations"]["invalid-config"].is_null());
+    assert!(state["allocations"]["invalid-reservation"].is_null());
+}
+
+#[cfg(unix)]
+#[test]
+fn concurrent_shared_new_processes_converge_on_main_supabase_ownership() {
+    let source = init_repo();
+    fs::create_dir_all(source.path().join("supabase")).unwrap();
+    fs::write(
+        source.path().join("supabase/config.toml"),
+        "project_id = \"main-project\"\n[api]\nport = 54321\n[db]\nport = 54322\n",
+    )
+    .unwrap();
+    git(source.path(), &["add", "supabase/config.toml"]);
+    git(
+        source.path(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-m",
+            "add supabase",
+        ],
+    );
+    let (_source, managed) = init_managed_from(source);
+    let bin = TempDir::new().unwrap();
+    let log = managed.path().join("supabase.log");
+    write_mock_supabase(bin.path());
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+    let binary = assert_cmd::cargo::cargo_bin!("wrt");
+
+    let spawn = |name: &str| {
+        StdCommand::new(binary)
+            .current_dir(managed.path())
+            .env("PATH", &path)
+            .env("MOCK_LOG", &log)
+            .args([
+                "new",
+                name,
+                "--install",
+                "false",
+                "--supabase",
+                "shared",
+                "--db",
+                "false",
+            ])
+            .spawn()
+            .unwrap()
+    };
+    let first = spawn("shared-one");
+    let second = spawn("shared-two");
+
+    let first = first.wait_with_output().unwrap();
+    let second = second.wait_with_output().unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(managed.path().join(".git/.wrt/state.json")).unwrap())
+            .unwrap();
+    assert_eq!(state["allocations"]["main"]["supabase"]["mode"], "owned");
+    assert_eq!(
+        state["allocations"]["shared-one"]["supabase"]["owner"],
+        "main"
+    );
+    assert_eq!(
+        state["allocations"]["shared-two"]["supabase"]["owner"],
+        "main"
+    );
+    assert_eq!(
+        state["allocations"]["main"]["ports"]["supabase.api.port"],
+        54321
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn setup_project_command_retries_with_the_same_complete_environment() {
+    let source = init_repo();
+    fs::create_dir_all(source.path().join("scripts")).unwrap();
+    fs::write(
+        source.path().join(".wrt.json"),
+        complete_v2_config(
+            r#"{
+  "version": 2,
+  "port_stride": 100,
+  "ports": [{
+    "key": "core-api",
+    "base_port": 3000,
+    "outputs": [
+      {"env": "CORE_API_PORT", "template": "{port}"},
+      {"env": "DATABASE_URL", "template": "postgresql://localhost:{port}/core"}
+    ]
+  }],
+  "commands": {
+    "setup": {"argv": ["sh", "setup.sh"], "cwd": "scripts"},
+    "db_reset": {"argv": ["sh", "setup.sh", "reset"], "cwd": "scripts"}
+  },
+  "supabase": {"config_path": "supabase/config.toml"}
+}"#,
+        ),
+    )
+    .unwrap();
+    fs::write(
+        source.path().join("scripts/setup.sh"),
+        r#"#!/bin/sh
+set -eu
+if [ "${1:-}" = reset ]; then
+  printf 'RESET\n' >> "$WRT_WORKTREE_PATH/setup.log"
+  exit 0
+fi
+printf '%s\t%s\t%s\t%s\t%s\n' "$WRT_NAME" "$COMPOSE_PROJECT_NAME" "$CORE_API_PORT" "$WRT_SERVICE_CORE_API_PORT" "$DATABASE_URL" >> "$WRT_WORKTREE_PATH/setup.log"
+test -f "$WRT_WORKTREE_PATH/.wrt.env"
+grep -q '^COMPOSE_PROJECT_NAME=' "$WRT_WORKTREE_PATH/.wrt.env"
+grep -q '^CORE_API_PORT=' "$WRT_WORKTREE_PATH/.wrt.env"
+grep -q '^DATABASE_URL=' "$WRT_WORKTREE_PATH/.wrt.env"
+if [ "$WRT_NAME" = retry-feature ] && [ ! -f "$WRT_WORKTREE_PATH/.setup-attempted" ]; then
+  touch "$WRT_WORKTREE_PATH/.setup-attempted"
+  exit 23
+fi
+"#,
+    )
+    .unwrap();
+    fs::write(
+        source.path().join("package.json"),
+        r#"{"scripts":{"setup":"false"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        source.path().join("pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\n",
+    )
+    .unwrap();
+    fs::create_dir_all(source.path().join("supabase")).unwrap();
+    fs::write(
+        source.path().join("supabase/config.toml"),
+        "project_id = \"project\"\n[api]\nport = 54321\n",
+    )
+    .unwrap();
+    git(source.path(), &["add", "."]);
+    git(
+        source.path(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-m",
+            "add project setup",
+        ],
+    );
+    let (_source, managed) = init_managed_from(source);
+
+    wrt_cmd()
+        .current_dir(managed.path())
+        .env("PATH", "/usr/bin:/bin")
+        .args([
+            "new",
+            "retry-feature",
+            "--install",
+            "true",
+            "--supabase",
+            "isolated",
+            "--db",
+            "true",
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "project setup command exited with status 23",
+        ));
+
+    let worktree = worktree_path(&managed, "retry-feature");
+    let state_path = managed.path().join(".git/.wrt/state.json");
+    let failed_state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    let failed_ports = failed_state["allocations"]["retry-feature"]["ports"].clone();
+    let failed_generation = failed_state["allocations"]["retry-feature"]["generationId"].clone();
+    assert_eq!(
+        failed_state["allocations"]["retry-feature"]["status"],
+        "failed"
+    );
+
+    wrt_cmd()
+        .current_dir(managed.path())
+        .env("PATH", "/usr/bin:/bin")
+        .args(["setup", "retry/feature"])
+        .assert()
+        .success();
+
+    let active_state: serde_json::Value =
+        serde_json::from_slice(&fs::read(state_path).unwrap()).unwrap();
+    assert_eq!(
+        active_state["allocations"]["retry-feature"]["ports"],
+        failed_ports
+    );
+    assert_eq!(
+        active_state["allocations"]["retry-feature"]["generationId"],
+        failed_generation
+    );
+    assert_eq!(
+        active_state["allocations"]["retry-feature"]["status"],
+        "active"
+    );
+
+    let log = fs::read_to_string(worktree.join("setup.log")).unwrap();
+    let attempts = log.lines().collect::<Vec<_>>();
+    assert_eq!(attempts.len(), 2, "{log}");
+    assert_eq!(attempts[0], attempts[1], "{log}");
+    assert!(attempts[0].starts_with("retry-feature\twrt-"), "{log}");
+    assert!(attempts[0].contains("\t3100\t3100\t"), "{log}");
+    assert!(
+        attempts[0].ends_with("postgresql://localhost:3100/core"),
+        "{log}"
+    );
+    assert!(!log.contains("RESET"), "{log}");
+    let supabase_config = fs::read_to_string(worktree.join("supabase/config.toml")).unwrap();
+    assert!(supabase_config.contains("project_id = \"project\""));
+    assert!(supabase_config.contains("port = 54321"));
+}
+
+#[cfg(unix)]
+#[test]
+fn setup_legacy_flow_writes_environment_before_install() {
+    let source = init_repo();
+    fs::write(
+        source.path().join("package.json"),
+        r#"{"scripts":{"dev":"echo dev"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        source.path().join("pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\n",
+    )
+    .unwrap();
+    git(source.path(), &["add", "."]);
+    git(
+        source.path(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-m",
+            "add package",
+        ],
+    );
+    let (_source, managed) = init_managed_from(source);
+    let bin = TempDir::new().unwrap();
+    write_mock_bin(
+        bin.path(),
+        "pnpm",
+        "#!/bin/sh\ntest -f .wrt.env\ngrep -q '^COMPOSE_PROJECT_NAME=' .wrt.env\nprintf 'installed\\n' >> install.log\n",
+    );
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+
+    wrt_cmd()
+        .current_dir(managed.path())
+        .env("PATH", &path)
+        .args([
+            "new",
+            "legacy-setup",
+            "--install",
+            "true",
+            "--supabase",
+            "none",
+            "--db",
+            "false",
+        ])
+        .assert()
+        .success();
+
+    wrt_cmd()
+        .current_dir(managed.path())
+        .env("PATH", &path)
+        .args(["setup", "legacy-setup"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read_to_string(worktree_path(&managed, "legacy-setup").join("install.log")).unwrap(),
+        "installed\ninstalled\n"
+    );
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(managed.path().join(".git/.wrt/state.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        state["allocations"]["legacy-setup"]["setup"]["install"],
+        "true"
+    );
+    assert_eq!(state["allocations"]["legacy-setup"]["setup"]["db"], "false");
 }
 
 #[test]

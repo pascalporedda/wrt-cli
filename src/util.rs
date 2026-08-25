@@ -3,7 +3,9 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::envx::ResolvedEnvironment;
 use crate::gitx::Repo;
+use crate::project::{CommandSpec, ProjectConfig};
 use crate::state::{Allocation, State};
 
 pub fn run_cmd(dir: &Path, cmd: &str, args: &[&str]) -> Result<()> {
@@ -26,7 +28,19 @@ pub fn run_argv_with_wrt_env(
     state: &State,
     dir: &Path,
     a: &Allocation,
+    project: Option<&ProjectConfig>,
     argv: &[String],
+) -> Result<i32> {
+    let environment = ResolvedEnvironment::build(repo, state, a, project)?;
+    run_argv_with_environment(state, dir, a, argv, &environment)
+}
+
+fn run_argv_with_environment(
+    state: &State,
+    dir: &Path,
+    a: &Allocation,
+    argv: &[String],
+    environment: &ResolvedEnvironment,
 ) -> Result<i32> {
     let cmd = &argv[0];
     let cmd_args = &argv[1..];
@@ -44,7 +58,7 @@ pub fn run_argv_with_wrt_env(
     for (k, v) in envs {
         c.env(k, v);
     }
-    crate::envx::apply_to_command_env(&mut c, repo, state, a)?;
+    environment.apply_to(&mut c);
     if Path::new(cmd).file_name().and_then(|name| name.to_str()) == Some("supabase") {
         // Supabase CLI reads `.git/HEAD` to label local database commands. Linked Git
         // worktrees use a `.git` file, so its fallback can report the managed root's branch.
@@ -64,6 +78,22 @@ pub fn run_argv_with_wrt_env(
         return Ok(status.code().unwrap_or(1));
     }
     Ok(0)
+}
+
+pub fn run_project_command(
+    state: &State,
+    worktree_root: &Path,
+    allocation: &Allocation,
+    environment: &ResolvedEnvironment,
+    command: &CommandSpec,
+) -> Result<i32> {
+    run_argv_with_environment(
+        state,
+        &command.working_dir(worktree_root),
+        allocation,
+        command.argv(),
+        environment,
+    )
 }
 
 pub fn which(bin: &str) -> Option<PathBuf> {

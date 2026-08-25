@@ -1,4 +1,5 @@
 mod db;
+mod doctor;
 mod env;
 mod housekeeping;
 mod init;
@@ -8,8 +9,10 @@ mod prune;
 mod rm;
 mod root;
 mod run;
+mod setup;
 
 pub use db::cmd_db;
+pub use doctor::cmd_doctor;
 pub use env::{cmd_env, cmd_path};
 pub use housekeeping::cmd_housekeeping;
 pub use init::cmd_init;
@@ -19,3 +22,4 @@ pub use prune::cmd_prune;
 pub use rm::cmd_rm;
 pub use root::{CloneOpts, RootInitOpts, cmd_clone, cmd_root_init, cmd_root_status};
 pub use run::{cmd_run, raw_run_has_sep};
+pub use setup::cmd_setup;

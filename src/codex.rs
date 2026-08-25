@@ -1,95 +1,8 @@
 use anyhow::{Context, Result, anyhow};
-use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
-
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-pub struct Discovery {
-    pub version: i32,
-    #[serde(rename = "port_block_size")]
-    pub port_block_size: i32,
-
-    pub package_manager: PackageManager,
-
-    #[serde(default)]
-    pub services: Vec<Service>,
-
-    #[serde(default)]
-    pub database: Database,
-
-    pub supabase: Supabase,
-
-    #[serde(default)]
-    pub notes: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-pub struct PackageManager {
-    pub name: String,
-    pub install_command: Vec<String>,
-    #[serde(default)]
-    pub notes: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-pub struct Service {
-    pub name: String,
-    #[serde(default)]
-    pub kind: Option<String>,
-    pub dev_command: Vec<String>,
-    #[serde(default)]
-    pub base_port: Option<i32>,
-    #[serde(default)]
-    pub port_env: Option<String>,
-    #[serde(default)]
-    pub url_env: Option<String>,
-    #[serde(default)]
-    pub notes: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-pub struct Supabase {
-    pub detected: bool,
-    #[serde(default)]
-    pub config_path: Option<String>,
-    #[serde(default)]
-    pub start_command: Option<Vec<String>>,
-    #[serde(default)]
-    pub base_ports: Option<BasePorts>,
-    #[serde(default)]
-    pub notes: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-pub struct Database {
-    pub detected: bool,
-    #[serde(default)]
-    pub kind: Option<String>,
-    #[serde(default)]
-    pub migrate_command: Option<Vec<String>>,
-    #[serde(default)]
-    pub seed_command: Option<Vec<String>>,
-    #[serde(default)]
-    pub reset_command: Option<Vec<String>>,
-    #[serde(default)]
-    pub notes: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-pub struct BasePorts {
-    #[serde(default)]
-    pub api: Option<i32>,
-    #[serde(default)]
-    pub db: Option<i32>,
-    #[serde(default, rename = "shadow_db")]
-    pub shadow_db: Option<i32>,
-    #[serde(default)]
-    pub studio: Option<i32>,
-    #[serde(default)]
-    pub inbucket: Option<i32>,
-}
 
 #[derive(Clone, Debug)]
 pub struct DiscoverOpts {
@@ -112,16 +25,14 @@ static PROMPT_TEXT: &str = include_str!("../assets/discover.txt");
 pub const DEFAULT_MODEL: &str = "gpt-5.6-sol";
 const REASONING_EFFORT: &str = "medium";
 
-pub fn discover(opts: DiscoverOpts) -> Result<(Vec<u8>, Discovery)> {
+pub fn discover(opts: DiscoverOpts) -> Result<Vec<u8>> {
     if let Ok(v) = std::env::var("WRT_CODEX_MOCK_OUTPUT") {
         if !v.trim().is_empty() {
             let b = fs::read(&v).with_context(|| format!("read {v}"))?;
-            let d: Discovery = serde_json::from_slice(&b).unwrap_or_default();
-            return Ok((b, d));
+            return Ok(b);
         }
     }
 
-    // Fail early with a clear message if codex isn't installed.
     let codex = which("codex")?;
 
     let tmp = TempDir::new().context("mk temp dir")?;
@@ -153,12 +64,10 @@ pub fn discover(opts: DiscoverOpts) -> Result<(Vec<u8>, Discovery)> {
     }
 
     let b = fs::read(&out_path).with_context(|| format!("read {}", out_path.display()))?;
-    let d: Discovery = serde_json::from_slice(&b).unwrap_or_default();
-    Ok((b, d))
+    Ok(b)
 }
 
 fn which(bin: &str) -> Result<PathBuf> {
-    // Minimal "which" to avoid pulling in more deps.
     let path = std::env::var_os("PATH").ok_or_else(|| anyhow!("PATH not set"))?;
     for p in std::env::split_paths(&path) {
         let cand = p.join(bin);
@@ -179,15 +88,65 @@ fn which(bin: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::ProjectConfig;
+
+    const DISCOVERY_V2: &str = r#"{
+      "version": 2,
+      "port_stride": 100,
+      "ports": [
+        {
+          "key": "postgres",
+          "base_port": 5432,
+          "outputs": [
+            {"env": "POSTGRES_PORT", "template": "{port}"},
+            {"env": "DATABASE_URL", "template": "postgresql://postgres:postgres@localhost:{port}/core"},
+            {"env": "AUTH_DATABASE_URL", "template": "postgresql://postgres:postgres@localhost:{port}/auth"},
+            {"env": "NOTIFICATION_DATABASE_URL", "template": "postgresql://postgres:postgres@localhost:{port}/notification"}
+          ]
+        },
+        {
+          "key": "redis",
+          "base_port": 6379,
+          "outputs": [{"env": "REDIS_PORT", "template": "{port}"}]
+        },
+        {
+          "key": "core-api",
+          "base_port": 3000,
+          "outputs": [
+            {"env": "CORE_API_PORT", "template": "{port}"},
+            {"env": "VITE_API_URL", "template": "http://localhost:{port}/api/v1"}
+          ]
+        },
+        {
+          "key": "web",
+          "base_port": 5173,
+          "outputs": [{"env": "WEB_PORT", "template": "{port}"}]
+        }
+      ],
+      "commands": {
+        "setup": {"argv": ["pnpm", "setup"], "cwd": null},
+        "start": {"argv": ["pnpm", "start"], "cwd": null},
+        "stop": {"argv": ["pnpm", "stop"], "cwd": null},
+        "status": {"argv": ["pnpm", "status"], "cwd": null},
+        "db_migrate": {"argv": ["pnpm", "db:migrate"], "cwd": null},
+        "db_seed": {"argv": ["pnpm", "db:seed"], "cwd": null},
+        "db_reset": {"argv": ["pnpm", "db:reset"], "cwd": null}
+      },
+      "compose": {"files": ["compose.yaml"]},
+      "supabase": null
+    }"#;
 
     fn must_be_object(v: &serde_json::Value) -> &serde_json::Map<String, serde_json::Value> {
         v.as_object().expect("object")
     }
 
     fn check_required_includes_all_properties(schema: &serde_json::Value) {
-        // Codex/OpenAI response_format schema validation is stricter than general JSON Schema:
-        // if an object defines properties, it must define required and include every property key.
         if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
+            assert_eq!(
+                schema.get("additionalProperties"),
+                Some(&serde_json::Value::Bool(false)),
+                "object schema must reject unknown fields"
+            );
             let required = schema
                 .get("required")
                 .and_then(|v| v.as_array())
@@ -198,13 +157,11 @@ mod tests {
                 assert!(ok, "required missing property key: {k}");
             }
 
-            // Recurse into property schemas.
             for v in props.values() {
                 check_required_includes_all_properties(v);
             }
         }
 
-        // Recurse into array item schemas.
         if let Some(items) = schema.get("items") {
             check_required_includes_all_properties(items);
         }
@@ -215,18 +172,89 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(SCHEMA_BYTES).expect("schema json");
         check_required_includes_all_properties(&v);
 
-        // Quick regression for the reported failure.
-        let pm = must_be_object(&v)["properties"]["package_manager"].clone();
-        let req = pm
-            .get("required")
-            .and_then(|v| v.as_array())
-            .expect("package_manager.required");
-        assert!(req.iter().any(|x| x.as_str() == Some("notes")));
+        let root = must_be_object(&v);
+        assert_eq!(root["properties"]["version"]["const"], 2);
+        assert_eq!(
+            property_names(&root["properties"]),
+            [
+                "commands",
+                "compose",
+                "port_stride",
+                "ports",
+                "supabase",
+                "version",
+            ]
+        );
+        assert_eq!(
+            property_names(&root["properties"]["commands"]["properties"]),
+            [
+                "db_migrate",
+                "db_reset",
+                "db_seed",
+                "setup",
+                "start",
+                "status",
+                "stop",
+            ]
+        );
     }
 
     #[test]
-    fn embedded_prompt_mentions_null_for_unknown_fields() {
-        assert!(PROMPT_TEXT.contains("use null"));
-        assert!(PROMPT_TEXT.contains("Do not omit"));
+    fn discovery_schema_and_project_config_accept_the_same_v2_shape() {
+        let config = ProjectConfig::from_slice(DISCOVERY_V2.as_bytes()).unwrap();
+
+        assert_eq!(config.port_stride(), 100);
+        assert_eq!(config.ports().len(), 4);
+        assert_eq!(config.commands().setup().unwrap().argv(), ["pnpm", "setup"]);
+        assert!(config.supabase().is_none());
+    }
+
+    #[test]
+    fn discovery_schema_nullable_fields_map_to_project_config_options() {
+        let config = ProjectConfig::from_slice(
+            br#"{
+              "version": 2,
+              "port_stride": 100,
+              "ports": [],
+              "commands": {
+                "setup": null,
+                "start": null,
+                "stop": null,
+                "status": null,
+                "db_migrate": null,
+                "db_seed": null,
+                "db_reset": null
+              },
+              "compose": null,
+              "supabase": null
+            }"#,
+        )
+        .unwrap();
+
+        assert!(config.ports().is_empty());
+        assert!(config.commands().setup().is_none());
+        assert!(config.supabase().is_none());
+    }
+
+    #[test]
+    fn embedded_prompt_defines_the_project_owned_contract() {
+        for text in [
+            "Use `null`",
+            "host-reachable port",
+            "must be safe to run again",
+            "Never use a reset command as `setup`",
+            "db_migrate",
+            "db_seed",
+            "db_reset",
+            "ordered repository-relative Compose files",
+            "cannot use a host `localhost` URL",
+            "supabase/config.toml",
+        ] {
+            assert!(PROMPT_TEXT.contains(text), "prompt missing {text:?}");
+        }
+    }
+
+    fn property_names(value: &serde_json::Value) -> Vec<&str> {
+        must_be_object(value).keys().map(String::as_str).collect()
     }
 }

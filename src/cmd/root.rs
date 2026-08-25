@@ -6,7 +6,11 @@ use std::process::Command;
 use crate::cli::RootSupabaseMode;
 use crate::cmd::new::{SetupModes, setup_existing_worktree};
 use crate::gitx;
-use crate::state::{Allocation, LAYOUT_MANAGED_ROOT, RootState, State, SupabaseAllocation};
+use crate::project::ProjectConfig;
+use crate::state::{
+    Allocation, AllocationGeneration, AllocationSetup, LAYOUT_MANAGED_ROOT, RootState, State,
+    StateStore, SupabaseAllocation, merge_port_assignments, project_port_assignments,
+};
 use crate::supabase;
 use crate::ui;
 use crate::util::run_cmd;
@@ -57,8 +61,15 @@ pub fn cmd_root_init(log: &ui::Logger, opts: RootInitOpts<'_>) -> Result<i32> {
     } else {
         cwd.join(source)
     };
+    let source_project = if source.is_dir() {
+        ProjectConfig::load_optional(&source.join(".wrt.json"))
+    } else {
+        Ok(None)
+    };
     let target = if source.is_dir() {
-        supabase::resolve_target(&source, opts.supabase_config, None)
+        source_project.and_then(|project| {
+            supabase::resolve_target(opts.supabase_config, None, project.as_ref())
+        })
     } else {
         supabase::Target::from_config_path(
             opts.supabase_config
@@ -175,41 +186,34 @@ pub fn cmd_root_init(log: &ui::Logger, opts: RootInitOpts<'_>) -> Result<i32> {
             SupabaseAllocation::None
         };
 
+    let project_config = ProjectConfig::load_for(&root, &main_path)?;
+    let mut ports = project_config
+        .as_ref()
+        .map(|config| project_port_assignments(config, 0))
+        .transpose()?
+        .unwrap_or_default();
+    if let SupabaseAllocation::Owned { config_path, .. } = &supabase_state {
+        let target = supabase::Target::from_config_path(config_path)?;
+        let claims = supabase::port_claims(&main_path, &target, 0)?;
+        merge_port_assignments(&mut ports, claims)?;
+    }
+    let generation_id = AllocationGeneration::new();
     let alloc = Allocation {
+        generation_id,
         name: worktree::slug(&branch),
         branch: branch.clone(),
         path: main_path.to_string_lossy().to_string(),
         block: 0,
         offset: 0,
+        ports,
         status: "creating".to_string(),
         created_at: created_at.clone(),
         supabase: supabase_state,
+        setup: AllocationSetup {
+            install: opts.install_mode.to_string(),
+            db: opts.db_mode.to_string(),
+        },
     };
-
-    let mut st = State::empty();
-    st.root = Some(RootState {
-        layout: LAYOUT_MANAGED_ROOT.to_string(),
-        managed_root: root.to_string_lossy().to_string(),
-        git_common_dir: git_dir.to_string_lossy().to_string(),
-        main_worktree: main_path.to_string_lossy().to_string(),
-        worktrees_path: root.to_string_lossy().to_string(),
-        created_at,
-        supabase_config_path: (opts.supabase_config.is_some() || has_supabase)
-            .then(|| target.config_path_string()),
-    });
-    let primary_key = alloc.name.clone();
-    st.allocations.insert(primary_key.clone(), alloc.clone());
-    st.save(&git_dir)?;
-    let _ = gitx::ensure_info_exclude(&git_dir, &[".env", ".env.local", ".wrt.env", ".wrt.json"]);
-
-    if let Some(error) = setup_failure {
-        if let Some(a) = st.allocations.get_mut(&primary_key) {
-            a.status = "failed".to_string();
-        }
-        st.save(&git_dir)?;
-        log.errorf(&error);
-        return Ok(1);
-    }
 
     let repo = gitx::Repo::new(
         root.clone(),
@@ -218,24 +222,74 @@ pub fn cmd_root_init(log: &ui::Logger, opts: RootInitOpts<'_>) -> Result<i32> {
         root.clone(),
         Some(main_path.clone()),
     );
+    let store = StateStore::new(&repo);
+    let root_state = RootState {
+        layout: LAYOUT_MANAGED_ROOT.to_string(),
+        managed_root: root.to_string_lossy().to_string(),
+        git_common_dir: git_dir.to_string_lossy().to_string(),
+        main_worktree: main_path.to_string_lossy().to_string(),
+        worktrees_path: root.to_string_lossy().to_string(),
+        created_at,
+        supabase_config_path: (opts.supabase_config.is_some() || has_supabase)
+            .then(|| target.config_path_string()),
+    };
+    let primary_key = alloc.name.clone();
+    store.update(|state| {
+        if state.root.is_some() || !state.allocations.is_empty() {
+            anyhow::bail!("managed root state already exists");
+        }
+        state.root = Some(root_state);
+        state.allocations.insert(primary_key.clone(), alloc);
+        Ok(())
+    })?;
+    let mut st = store.read()?;
+    let _ = gitx::ensure_info_exclude(&git_dir, &[".env", ".env.local", ".wrt.env", ".wrt.json"]);
+
+    if let Some(error) = setup_failure {
+        store.update(|state| {
+            let allocation = state.allocation_mut_if_generation(&primary_key, generation_id)?;
+            allocation.status = "failed".to_string();
+            Ok(())
+        })?;
+        log.errorf(&error);
+        return Ok(1);
+    }
+
     let modes = SetupModes {
         install_mode: opts.install_mode,
         db_mode: opts.db_mode,
     };
+    let setup_allocation = st
+        .allocations
+        .get(&primary_key)
+        .cloned()
+        .ok_or_else(|| anyhow!("primary worktree allocation is missing"))?;
 
-    if let Err(e) = setup_existing_worktree(log, &repo, &mut st, &primary_key, &main_path, modes) {
-        if let Some(a) = st.allocations.get_mut(&primary_key) {
-            a.status = "failed".to_string();
+    if let Err(e) = setup_existing_worktree(
+        log,
+        &repo,
+        &store,
+        &mut st,
+        &setup_allocation,
+        project_config.as_ref(),
+        modes,
+    ) {
+        if let Err(status_error) = store.update(|state| {
+            let allocation = state.allocation_mut_if_generation(&primary_key, generation_id)?;
+            allocation.status = "failed".to_string();
+            Ok(())
+        }) {
+            log.errorf(&format!("record main setup failure failed: {status_error}"));
         }
-        let _ = st.save(&git_dir);
         log.errorf(&format!("main setup failed: {e}"));
         return Ok(1);
     }
 
-    if let Some(a) = st.allocations.get_mut(&primary_key) {
-        a.status = "active".to_string();
-    }
-    st.save(&git_dir)?;
+    store.update(|state| {
+        let allocation = state.allocation_mut_if_generation(&primary_key, generation_id)?;
+        allocation.status = "active".to_string();
+        Ok(())
+    })?;
 
     log.infof(&format!("managed root ready: {}", root.display()));
     Ok(0)

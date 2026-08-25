@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::path::Path;
 
 use crate::gitx;
+use crate::project::ProjectConfig;
 use crate::state::State;
 use crate::ui;
 use crate::util::run_argv_with_wrt_env;
@@ -45,7 +46,8 @@ pub fn cmd_run(
         a.path
     ));
 
-    match run_argv_with_wrt_env(repo, st, Path::new(&a.path), a, command) {
+    let project = ProjectConfig::load_for(&repo.config_root, Path::new(&a.path))?;
+    match run_argv_with_wrt_env(repo, st, Path::new(&a.path), a, project.as_ref(), command) {
         Ok(code) => Ok(code),
         Err(e) => {
             log.errorf(&format!("run failed: {e}"));

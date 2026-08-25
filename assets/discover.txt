@@ -1,45 +1,36 @@
-You are generating a repo-local configuration file for a developer tool called "wrt".
+Generate the version 2 repo-local configuration for `wrt`.
 
-Goal: enable parallel git worktrees for agentic coding by providing:
-- package manager install command
-- services/dev commands and how to offset ports to avoid collisions
-- whether Supabase local dev is used, and its base ports (from supabase/config.toml if present)
-- database tooling info: whether the repo has DB migrations/seeding and how to run migrate/seed/reset
+`wrt` creates parallel Git worktrees. It reserves host ports, writes environment variables, and runs commands that the repository owns. Inspect the repository files in the current directory. Prefer package scripts and checked-in configuration over inferred commands.
 
-Instructions:
-- Inspect files in the current repo.
-- Prefer explicit data from config files over guesses.
-- Use WRT_PORT_OFFSET (integer) as the offset to add to base ports.
-- Emit ONLY valid JSON matching the provided JSON Schema.
-- IMPORTANT: Do not omit object fields. If a field is unknown/unset, use null.
+Return only JSON that matches the provided schema. Include every field. Use `null` for an optional command, Compose configuration, Supabase configuration, or command working directory that the repository does not define.
 
-Output guidance:
-- version: 1
-- port_block_size: 100
-- package_manager: best detected ("unknown" if unclear)
-- services: include major apps/services with their dev command as argv array
-- database: detect DB tooling and provide commands (argv arrays) for migrate/seed/reset if the repo has them
-  - Only support these tooling kinds: supabase, prisma, sqlx. If unclear, set database.kind to "unknown" or null.
-  - Prefer providing a reset command when possible (reset is the best "one-shot" local setup).
-  - Supabase:
-  - Search for any repo-relative path ending in `supabase/config.toml`, including nested monorepo projects.
-    - Set database.kind="supabase".
-    - reset_command: ["supabase","db","reset"] (preferred).
-    - migrate_command/seed_command: optional; can be null if reset covers it.
-  - Prisma:
-    - Detect via `prisma/schema.prisma` (or schema.prisma).
-    - Set database.kind="prisma".
-    - Prefer package.json scripts if present (db:reset/db:seed/db:migrate). If no scripts, use npx:
-      - reset_command: ["npx","prisma","migrate","reset"] (destructive).
-      - migrate_command: ["npx","prisma","migrate","dev"] (may be interactive; use scripts if available).
-      - seed_command: ["npx","prisma","db","seed"] (if configured).
-  - SQLx (Rust):
-    - Detect via Cargo.toml containing "sqlx" and/or `sqlx-data.json` and/or `migrations/`.
-    - Set database.kind="sqlx".
-    - migrate_command: ["cargo","sqlx","migrate","run"] (if migrations exist).
-    - reset_command: often not available; set null unless the repo defines a clear reset script/command.
-    - seed_command: set null unless the repo has an explicit seed script.
-- supabase.detected: true only if a `supabase/config.toml` file exists
-- supabase.config_path: the exact repo-relative path to that file if detected, otherwise null
-- supabase.start_command: ["supabase","start"] if detected, otherwise null
-- supabase.base_ports: include any known ports (null for unknown ports; null for the whole object if not detected)
+Set `version` to `2`. Set `port_stride` to a positive amount that keeps common allocations apart. Use `100` unless the repository's host-port range needs a larger value.
+
+Add one `ports` entry for each host-reachable port that parallel worktrees must isolate. Do not add Compose-internal ports that other host processes cannot reach. Use the checked-in default as `base_port`. Use a stable lowercase key with hyphens.
+
+Each port output names an environment variable that the repository already consumes. The output template must contain `{port}` and no other placeholder. Emit direct ports such as `CORE_API_PORT={port}` and host-process values such as `DATABASE_URL=postgresql://postgres:postgres@localhost:{port}/core` or `VITE_API_URL=http://localhost:{port}/api/v1`. Put all host URLs derived from one host port on that port's `outputs` list. Do not invent an environment variable when the repository has no way to consume it.
+
+`wrt` injects every output into setup, start, stop, status, and database commands. A Compose container cannot use a host `localhost` URL to reach another container. Do not emit a host URL under a variable that Compose interpolates into a container-only service-DNS value. When host processes and Compose containers need different addresses, emit only the repository's separate host variable. The Compose file must keep container connections on names such as `postgres:5432` and `redis:6379`.
+
+Use repository-owned commands:
+
+- `setup` prepares a checkout without deleting developer data. It must be safe to run again after a partial failure. Prefer an explicit setup or bootstrap script. Never use a reset command as `setup`.
+- `start`, `stop`, and `status` control the project's local runtime. Use `null` when the repository has no explicit command.
+- `db_migrate` applies pending migrations without deleting existing data.
+- `db_seed` adds required seed data without resetting the database.
+- `db_reset` is the repository's explicit destructive reset command. Keep it separate from `setup`, `db_migrate`, and `db_seed`.
+
+Write each command as a non-empty `argv` array. Do not wrap a command in `sh -c`. Set `cwd` to a repository-relative directory only when the command must run below the repository root. Otherwise set `cwd` to `null`.
+
+Set `compose` to the ordered repository-relative Compose files that the project's own commands use. Include base and override files in command-line order. Set `compose` to `null` when the repository does not use Docker Compose. Do not rewrite Compose YAML or include generated files.
+
+Set `supabase.config_path` to the exact repository-relative path that ends in `supabase/config.toml`. Set `supabase` to `null` when that file does not exist. Supabase is optional and does not replace project-level setup or database commands.
+
+Before returning JSON, check these facts against the repository:
+
+- Every command exists as a package script, executable, or documented tool invocation.
+- Every output environment variable appears in repository code or configuration.
+- No host `localhost` output replaces a Compose container's service-DNS connection.
+- Every Compose file and command working directory exists.
+- `setup` does not invoke `db_reset` or another destructive reset path.
+- The configuration contains only host-bound ports and accepted version 2 fields.
