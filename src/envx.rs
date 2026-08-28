@@ -9,7 +9,7 @@ use crate::gitx::Repo;
 use crate::project::ProjectConfig;
 use crate::state::{Allocation, State};
 use crate::supabase;
-use crate::util::sh_quote;
+use crate::util::{atomic_write_private, sh_quote, validate_write_target};
 use crate::worktree;
 
 const SUPABASE_BLOCK_START: &str = "# >>> wrt supabase (generated)";
@@ -208,14 +208,14 @@ pub fn sync_env_files(
 
     for (path, relative) in env_paths {
         if supabase_vars.is_empty() {
-            remove_managed_block(&path)?;
-            remove_managed_block(&path.with_file_name(".env.local"))?;
+            remove_managed_block(wt_path, &path)?;
+            remove_managed_block(wt_path, &path.with_file_name(".env.local"))?;
         } else {
             let output_path = env_output_path(wt_path, &path, &relative)?;
             if output_path != path {
-                remove_managed_block(&path)?;
+                remove_managed_block(wt_path, &path)?;
             }
-            write_managed_block(&output_path, &supabase_vars)?;
+            write_managed_block(wt_path, &output_path, &supabase_vars)?;
         }
     }
     Ok(())
@@ -230,7 +230,7 @@ fn write_wrt_env_file(wt_path: &Path, environment: &ResolvedEnvironment) -> Resu
         out.push_str(&sh_quote(v));
         out.push('\n');
     }
-    fs::write(&p, out.as_bytes()).with_context(|| format!("write {}", p.display()))?;
+    atomic_write_private(wt_path, &p, out.as_bytes())?;
     Ok(())
 }
 
@@ -308,7 +308,12 @@ fn is_supabase_env_name(key: &str) -> bool {
     key.starts_with("SUPABASE_") || key == "DATABASE_URL"
 }
 
-fn write_managed_block(path: &Path, vars: &BTreeMap<String, String>) -> Result<()> {
+fn write_managed_block(
+    trusted_root: &Path,
+    path: &Path,
+    vars: &BTreeMap<String, String>,
+) -> Result<()> {
+    validate_write_target(trusted_root, path)?;
     let mut input = match fs::read_to_string(path) {
         Ok(input) => input,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -331,13 +336,11 @@ fn write_managed_block(path: &Path, vars: &BTreeMap<String, String>) -> Result<(
     }
     input.push_str(SUPABASE_BLOCK_END);
     input.push('\n');
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
-    }
-    fs::write(path, input).with_context(|| format!("write {}", path.display()))
+    atomic_write_private(trusted_root, path, input.as_bytes())
 }
 
-fn remove_managed_block(path: &Path) -> Result<()> {
+fn remove_managed_block(trusted_root: &Path, path: &Path) -> Result<()> {
+    validate_write_target(trusted_root, path)?;
     let mut input = match fs::read_to_string(path) {
         Ok(input) => input,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -346,7 +349,7 @@ fn remove_managed_block(path: &Path) -> Result<()> {
     if !remove_block_from_string(&mut input)? {
         return Ok(());
     }
-    fs::write(path, input).with_context(|| format!("write {}", path.display()))
+    atomic_write_private(trusted_root, path, input.as_bytes())
 }
 
 fn remove_block_from_string(input: &mut String) -> Result<bool> {
@@ -627,14 +630,14 @@ mod tests {
             ("SUPABASE_ANON_KEY".to_string(), "anon".to_string()),
         ]);
 
-        write_managed_block(&path, &vars).unwrap();
-        write_managed_block(&path, &vars).unwrap();
+        write_managed_block(td.path(), &path, &vars).unwrap();
+        write_managed_block(td.path(), &path, &vars).unwrap();
         let output = fs::read_to_string(&path).unwrap();
         assert_eq!(output.matches(SUPABASE_BLOCK_START).count(), 1);
         assert!(output.contains("EXISTING=value"));
         assert!(output.contains("SUPABASE_ANON_KEY='anon'"));
 
-        remove_managed_block(&path).unwrap();
+        remove_managed_block(td.path(), &path).unwrap();
         let output = fs::read_to_string(path).unwrap();
         assert_eq!(output, "EXISTING=value\n");
     }

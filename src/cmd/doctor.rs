@@ -7,15 +7,11 @@ use crate::gitx::Repo;
 use crate::project::ProjectConfig;
 use crate::state::State;
 use crate::ui;
-use crate::util::infer_worktree_from_cwd;
+use crate::util::resolve_worktree_name;
 use crate::worktree;
 
 pub fn cmd_doctor(log: &ui::Logger, repo: &Repo, state: &State, name: Option<&str>) -> Result<i32> {
-    let name = name
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .or_else(|| infer_worktree_from_cwd(state));
+    let name = resolve_worktree_name(state, name, None);
     let Some(name) = name else {
         log.errorf("missing <name> (or run inside a worktree)");
         return Ok(2);

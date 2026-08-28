@@ -2,7 +2,12 @@ use anyhow::{Context, Result, anyhow};
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 #[derive(Clone, Debug)]
 pub struct DiscoverOpts {
@@ -24,6 +29,7 @@ static PROMPT_TEXT: &str = include_str!("../assets/discover.txt");
 
 pub const DEFAULT_MODEL: &str = "gpt-5.6-sol";
 const REASONING_EFFORT: &str = "medium";
+const CODEX_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub fn discover(opts: DiscoverOpts) -> Result<Vec<u8>> {
     if let Ok(v) = std::env::var("WRT_CODEX_MOCK_OUTPUT") {
@@ -41,9 +47,11 @@ pub fn discover(opts: DiscoverOpts) -> Result<Vec<u8>> {
     fs::write(&schema_path, SCHEMA_BYTES)
         .with_context(|| format!("write {}", schema_path.display()))?;
 
-    let status = Command::new(codex)
+    let mut command = Command::new(codex);
+    command
         .arg("exec")
         .arg(PROMPT_TEXT)
+        .args(["--sandbox", "read-only", "--ephemeral"])
         .arg("--output-schema")
         .arg(&schema_path)
         .arg("-o")
@@ -55,9 +63,11 @@ pub fn discover(opts: DiscoverOpts) -> Result<Vec<u8>> {
         .current_dir(&opts.repo_root)
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
-        .stdin(Stdio::inherit())
-        .status()
-        .context("run codex")?;
+        .stdin(Stdio::null());
+    configure_process_group(&mut command);
+    let mut child = command.spawn().context("run codex")?;
+
+    let status = wait_for_child(&mut child, CODEX_TIMEOUT)?;
 
     if !status.success() {
         return Err(anyhow!("codex exec failed"));
@@ -65,6 +75,59 @@ pub fn discover(opts: DiscoverOpts) -> Result<Vec<u8>> {
 
     let b = fs::read(&out_path).with_context(|| format!("read {}", out_path.display()))?;
     Ok(b)
+}
+
+fn wait_for_child(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("wait for codex")? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            terminate_child_tree(child).context("kill timed out codex process")?;
+            child.wait().context("reap timed out codex process")?;
+            return Err(anyhow!(
+                "codex exec timed out after {} seconds",
+                timeout.as_secs_f64()
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    Ok(status)
+}
+
+#[cfg(unix)]
+fn configure_process_group(command: &mut Command) {
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_process_group(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate_child_tree(child: &mut std::process::Child) -> std::io::Result<()> {
+    let process_group = i32::try_from(child.id())
+        .map_err(|_| std::io::Error::other("child process id exceeds Unix pid range"))?;
+    // SAFETY: `process_group(0)` made this positive child PID the group ID; `kill` reads no memory.
+    let result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_child_tree(child: &mut std::process::Child) -> std::io::Result<()> {
+    child.kill()
 }
 
 fn which(bin: &str) -> Result<PathBuf> {
@@ -249,9 +312,47 @@ mod tests {
             "ordered repository-relative Compose files",
             "cannot use a host `localhost` URL",
             "supabase/config.toml",
+            "untrusted data",
         ] {
             assert!(PROMPT_TEXT.contains(text), "prompt missing {text:?}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kills_and_reaps_codex_child() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 10"]);
+        configure_process_group(&mut command);
+        let mut child = command.spawn().unwrap();
+        let error = wait_for_child(&mut child, Duration::from_millis(25)).unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kills_codex_grandchildren() {
+        use std::io::Read;
+        use std::sync::mpsc;
+
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 10 & wait"])
+            .stdout(Stdio::piped());
+        configure_process_group(&mut command);
+        let mut child = command.spawn().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+
+        let error = wait_for_child(&mut child, Duration::from_millis(25)).unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
+
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || sender.send(stdout.read_to_end(&mut Vec::new())).unwrap());
+        let read_result = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("grandchild kept the inherited pipe open after timeout");
+        assert_eq!(read_result.unwrap(), 0);
     }
 
     fn property_names(value: &serde_json::Value) -> Vec<&str> {

@@ -50,6 +50,10 @@ pub fn cmd_rm(
     log.infof(&format!("removing worktree: {} ({})", a.name, a.path));
 
     let wt_path = Path::new(&a.path);
+    if repo.worktree_path(&key) != wt_path {
+        anyhow::bail!("refusing removal because allocation name and path do not match");
+    }
+    worktree::verify_registered_worktree(&repo.common_dir, wt_path, &a.branch)?;
     let owned = match &a.supabase {
         SupabaseAllocation::Owned {
             project_id,

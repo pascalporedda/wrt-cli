@@ -12,6 +12,39 @@ _wrt_branches() {
   _describe -t branches 'branch' branches
 }
 
+_wrt_runtime_target() {
+  _alternative \
+    'actions:action:(start stop status)' \
+    'worktrees:worktree:_wrt_worktrees'
+}
+
+_wrt_db_target() {
+  _alternative \
+    'actions:action:(reset seed migrate)' \
+    'worktrees:worktree:_wrt_worktrees'
+}
+
+_wrt_db_action() {
+  local index skip_value=0
+  REPLY=
+
+  for (( index = 3; index < CURRENT; index++ )); do
+    if (( skip_value )); then
+      skip_value=0
+      continue
+    fi
+
+    case $words[index] in
+      --worktree) skip_value=1 ;;
+      --worktree=*) ;;
+      reset|seed|migrate)
+        REPLY=$words[index]
+        return
+        ;;
+    esac
+  done
+}
+
 _wrt() {
   local context state state_descr line
 
@@ -34,6 +67,7 @@ _wrt() {
         'env[Print exports for a worktree]' \
         'doctor[Check Compose worktree isolation]' \
         'setup[Retry setup for a worktree]' \
+        'runtime[Run a repository-owned runtime command]' \
         'rm[Remove a worktree]' \
         'remove[Remove a worktree]' \
         'prune[Prune git worktrees and state]' \
@@ -59,16 +93,48 @@ _wrt() {
           _arguments '1::worktree:_wrt_worktrees'
           return
           ;;
+        runtime)
+          case $line[2] in
+            start|stop|status)
+              _arguments \
+                '--worktree=[Explicit worktree name]:worktree:_wrt_worktrees'
+              return
+              ;;
+          esac
+          _arguments -C \
+            '1:worktree or action:_wrt_runtime_target' \
+            '2:action:(start stop status)' \
+            '--worktree=[Explicit worktree name]:worktree:_wrt_worktrees'
+          return
+          ;;
         run)
           _arguments -C '1:worktree:_wrt_worktrees' '*::command:_command_names -e'
           return
           ;;
         db)
-          _arguments -C \
-            '1::worktree:_wrt_worktrees' \
-            '2:action:(reset seed migrate)' \
-            '--print[Print the command that would be run and exit]' \
-            '--yes[Skip interactive prompts (reset only)]'
+          local db_action
+          _wrt_db_action
+          db_action=$REPLY
+
+          case $db_action in
+            reset)
+              _arguments -C \
+                '--print[Print the command that would be run and exit]' \
+                '--yes[Skip the reset confirmation]' \
+                '--worktree=[Explicit worktree name]:worktree:_wrt_worktrees'
+              ;;
+            seed|migrate)
+              _arguments -C \
+                '--print[Print the command that would be run and exit]' \
+                '--worktree=[Explicit worktree name]:worktree:_wrt_worktrees'
+              ;;
+            *)
+              _arguments -C \
+                '1:worktree or action:_wrt_db_target' \
+                '2:action:(reset seed migrate)' \
+                '--worktree=[Explicit worktree name]:worktree:_wrt_worktrees'
+              ;;
+          esac
           return
           ;;
         new|add)
@@ -98,6 +164,7 @@ _wrt() {
           _arguments -C \
             '--force[Overwrite existing .wrt.json]' \
             '--print[Print config and exit]' \
+            '--accept-commands[Accept generated executable commands]' \
             '--model=[Codex model]:model:'
           return
           ;;

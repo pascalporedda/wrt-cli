@@ -17,6 +17,9 @@ toml_edit = "0.22"
 uuid = { version = "1", features = ["serde", "v4"] }
 wait-timeout = "0.2"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"

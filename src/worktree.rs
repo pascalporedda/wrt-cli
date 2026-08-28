@@ -1,9 +1,35 @@
 use anyhow::{Context, Result, anyhow};
+use fs2::FileExt;
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+
+use crate::util::atomic_copy_private;
+
+const GIT_OPERATION_LOCK: &str = "git-worktree.lock";
+
+pub(crate) struct GitOperationLock {
+    _file: File,
+}
+
+pub(crate) fn lock_git_operations(git_dir: &Path) -> Result<GitOperationLock> {
+    let directory = git_dir.join(".wrt");
+    fs::create_dir_all(&directory).with_context(|| format!("create {}", directory.display()))?;
+    let path = directory.join(GIT_OPERATION_LOCK);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    file.lock_exclusive()
+        .with_context(|| format!("lock {}", path.display()))?;
+    Ok(GitOperationLock { _file: file })
+}
 
 pub fn slug(s: &str) -> String {
     let mut out = String::new();
@@ -41,6 +67,7 @@ pub fn ensure_dir(dir: &Path) -> Result<()> {
 }
 
 pub fn add(git_dir: &Path, wt_path: &Path, branch: &str, from_ref: &str) -> Result<()> {
+    let _lock = lock_git_operations(git_dir)?;
     let remotes = list_remotes(git_dir)?;
     let remote = pick_remote(&remotes);
 
@@ -139,7 +166,21 @@ pub fn add(git_dir: &Path, wt_path: &Path, branch: &str, from_ref: &str) -> Resu
     )
 }
 
+pub fn add_existing(git_dir: &Path, wt_path: &Path, branch: &str) -> Result<()> {
+    let _lock = lock_git_operations(git_dir)?;
+    run_git(
+        git_dir,
+        [
+            "worktree",
+            "add",
+            wt_path.to_string_lossy().as_ref(),
+            branch,
+        ],
+    )
+}
+
 pub fn remove(git_dir: &Path, wt_path: &Path, force: bool) -> Result<()> {
+    let _lock = lock_git_operations(git_dir)?;
     let mut args: Vec<String> = vec!["worktree".into(), "remove".into()];
     if force {
         args.push("--force".into());
@@ -148,7 +189,74 @@ pub fn remove(git_dir: &Path, wt_path: &Path, force: bool) -> Result<()> {
     run_git(git_dir, args)
 }
 
+pub fn verify_registered_worktree(
+    git_dir: &Path,
+    expected_path: &Path,
+    expected_branch: &str,
+) -> Result<()> {
+    let output = run_git_output(
+        git_dir,
+        &[
+            OsString::from("worktree"),
+            OsString::from("list"),
+            OsString::from("--porcelain"),
+        ],
+    )?;
+    if !output.status.success() {
+        return Err(git_failure(
+            git_dir,
+            &[
+                OsString::from("worktree"),
+                OsString::from("list"),
+                OsString::from("--porcelain"),
+            ],
+            &output,
+        ));
+    }
+    let expected_branch = format!("refs/heads/{expected_branch}");
+    let mut path: Option<PathBuf> = None;
+    let mut branch: Option<String> = None;
+    for line in String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .chain(std::iter::once(""))
+    {
+        if line.is_empty() {
+            if path
+                .as_deref()
+                .is_some_and(|path| same_canonical_path(path, expected_path))
+                && branch.as_deref() == Some(expected_branch.as_str())
+            {
+                return Ok(());
+            }
+            path = None;
+            branch = None;
+        } else if let Some(value) = line.strip_prefix("worktree ") {
+            path = Some(PathBuf::from(value));
+        } else if let Some(value) = line.strip_prefix("branch ") {
+            branch = Some(value.to_string());
+        }
+    }
+    anyhow::bail!(
+        "refusing removal because Git does not list {} on branch {}",
+        expected_path.display(),
+        expected_branch
+    )
+}
+
+fn same_canonical_path(first: &Path, second: &Path) -> bool {
+    match (fs::canonicalize(first), fs::canonicalize(second)) {
+        (Ok(first), Ok(second)) => first == second,
+        _ => first == second,
+    }
+}
+
+pub fn prune(git_dir: &Path) -> Result<()> {
+    let _lock = lock_git_operations(git_dir)?;
+    run_git(git_dir, ["worktree", "prune"])
+}
+
 pub fn delete_branch(git_dir: &Path, branch: &str) -> Result<()> {
+    let _lock = lock_git_operations(git_dir)?;
     run_git(git_dir, ["branch", "-D", branch])
 }
 
@@ -185,6 +293,7 @@ pub fn branch_upstream(git_dir: &Path, branch: &str) -> Result<Option<UpstreamBr
 }
 
 pub fn delete_remote_branch(git_dir: &Path, remote: &str, remote_branch: &str) -> Result<()> {
+    let _lock = lock_git_operations(git_dir)?;
     run_git(git_dir, ["push", remote, "--delete", remote_branch])
 }
 
@@ -207,30 +316,34 @@ pub fn copy_repo_env(repo_root: &Path, wt_path: &Path) -> Result<bool> {
 pub fn copy_repo_env_at(repo_root: &Path, wt_path: &Path, relative_dir: &Path) -> Result<bool> {
     let src = repo_root.join(relative_dir).join(".env");
     let dst = wt_path.join(relative_dir).join(".env");
-    copy_file(&src, &dst)
-}
-
-pub fn copy_repo_config(repo_root: &Path, wt_path: &Path) -> Result<bool> {
-    copy_repo_file(repo_root, wt_path, ".wrt.json")
+    copy_file(repo_root, &src, wt_path, &dst)
 }
 
 fn copy_repo_file(repo_root: &Path, wt_path: &Path, file_name: &str) -> Result<bool> {
     let src = repo_root.join(file_name);
     let dst = wt_path.join(file_name);
-    copy_file(&src, &dst)
+    copy_file(repo_root, &src, wt_path, &dst)
 }
 
-fn copy_file(src: &Path, dst: &Path) -> Result<bool> {
-    if !src.is_file() {
-        return Ok(false);
+fn copy_file(source_root: &Path, src: &Path, destination_root: &Path, dst: &Path) -> Result<bool> {
+    match fs::symlink_metadata(src) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            anyhow::bail!("refusing symlink source: {}", src.display())
+        }
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", src.display())),
     }
-    if dst.exists() {
-        return Ok(false);
+    match fs::symlink_metadata(dst) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            anyhow::bail!("refusing symlink destination: {}", dst.display())
+        }
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", dst.display())),
     }
-    if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
-    }
-    fs::copy(src, dst).with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
+    atomic_copy_private(source_root, src, destination_root, dst)?;
     Ok(true)
 }
 

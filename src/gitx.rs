@@ -111,6 +111,32 @@ pub fn ensure_info_exclude(common_dir: &Path, patterns: &[&str]) -> Result<()> {
     Ok(())
 }
 
+pub fn ensure_hooks_path(common_dir: &Path) -> Result<()> {
+    let configured = Command::new("git")
+        .arg("--git-dir")
+        .arg(common_dir)
+        .args(["config", "--local", "--get", "core.hooksPath"])
+        .output()
+        .context("read core.hooksPath")?;
+    if configured.status.success() && !configured.stdout.is_empty() {
+        return Ok(());
+    }
+
+    let hooks_dir = common_dir.join("hooks");
+    fs::create_dir_all(&hooks_dir).with_context(|| format!("mkdir {}", hooks_dir.display()))?;
+    let status = Command::new("git")
+        .arg("--git-dir")
+        .arg(common_dir)
+        .args(["config", "--local", "core.hooksPath"])
+        .arg(&hooks_dir)
+        .status()
+        .context("configure core.hooksPath")?;
+    if !status.success() {
+        return Err(anyhow!("git config core.hooksPath failed"));
+    }
+    Ok(())
+}
+
 fn git_out<I, S>(dir: &Path, args: I) -> Result<String>
 where
     I: IntoIterator<Item = S>,

@@ -126,7 +126,7 @@ where
     F: FnMut(&Path, &ComposeSpec, &ResolvedEnvironment) -> Result<Vec<u8>>,
 {
     let mut findings = Vec::new();
-    let second_allocation = match synthetic_allocation(allocation, project) {
+    let second_allocation = match synthetic_allocation(state, allocation, project) {
         Ok(allocation) => allocation,
         Err(error) => {
             findings.push(ComposeFinding {
@@ -178,36 +178,18 @@ where
     ComposeReport::new(findings)
 }
 
-fn synthetic_allocation(allocation: &Allocation, project: &ProjectConfig) -> Result<Allocation> {
-    let stride = i32::from(project.port_stride());
+fn synthetic_allocation(
+    state: &State,
+    allocation: &Allocation,
+    project: &ProjectConfig,
+) -> Result<Allocation> {
+    let request = crate::state::ReservationRequest::compose_probe(project, allocation)?;
+    let reservation = crate::state::reserve_ports(state, &request)?;
     let mut synthetic = allocation.clone();
     synthetic.name = format!("{}-compose-probe", allocation.name);
-    synthetic.block = allocation
-        .block
-        .checked_add(1)
-        .ok_or_else(|| anyhow!("allocation block overflow"))?;
-    synthetic.offset = allocation
-        .offset
-        .checked_add(stride)
-        .ok_or_else(|| anyhow!("allocation offset overflow"))?;
-    for spec in project.ports() {
-        let current = allocation
-            .ports
-            .get(spec.key())
-            .ok_or_else(|| anyhow!("allocation is missing port {:?}", spec.key().as_str()))?;
-        let shifted = i32::from(*current)
-            .checked_add(stride)
-            .filter(|port| (1..=65535).contains(port))
-            .ok_or_else(|| {
-                anyhow!(
-                    "port {:?} cannot be shifted by {} from {}",
-                    spec.key().as_str(),
-                    stride,
-                    current
-                )
-            })?;
-        synthetic.ports.insert(spec.key().clone(), shifted as u16);
-    }
+    synthetic.block = reservation.block;
+    synthetic.offset = reservation.offset;
+    synthetic.ports = reservation.ports;
     Ok(synthetic)
 }
 
@@ -510,35 +492,20 @@ fn compare(first: &RenderedCompose, second: &RenderedCompose, findings: &mut Vec
             .chain(second_service.port_groups.keys())
             .collect::<BTreeSet<_>>();
         for group in groups {
-            match (
-                first_service.port_groups.get(group),
-                second_service.port_groups.get(group),
-            ) {
-                (Some(first_ports), Some(second_ports)) => {
-                    if first_ports.len() != second_ports.len() {
-                        findings.push(shape_finding(
-                            service,
-                            &format!("ports.{}.{}", group.target, group.protocol),
-                            &first_ports.len().to_string(),
-                            &second_ports.len().to_string(),
-                        ));
-                    }
-                }
-                (first_ports, second_ports) => {
-                    let first = first_ports
-                        .map(|ports| ports.len().to_string())
-                        .unwrap_or_else(|| "missing".to_string());
-                    let second = second_ports
-                        .map(|ports| ports.len().to_string())
-                        .unwrap_or_else(|| "missing".to_string());
-                    findings.push(shape_finding(
-                        service,
-                        &format!("ports.{}.{}", group.target, group.protocol),
-                        &first,
-                        &second,
-                    ));
-                }
+            let first_ports = first_service.port_groups.get(group);
+            let second_ports = second_service.port_groups.get(group);
+            if first_ports.map(Vec::len) == second_ports.map(Vec::len) {
+                continue;
             }
+            let count = |ports: Option<&Vec<String>>| {
+                ports.map_or_else(|| "missing".to_string(), |ports| ports.len().to_string())
+            };
+            findings.push(shape_finding(
+                service,
+                &format!("ports.{}.{}", group.target, group.protocol),
+                &count(first_ports),
+                &count(second_ports),
+            ));
         }
     }
 }
@@ -718,6 +685,26 @@ mod tests {
             |_, _, _| Ok(outputs.next().unwrap()),
         );
         assert_eq!(report, ComposeReport::new(Vec::new()));
+    }
+
+    #[test]
+    fn synthetic_probe_uses_a_lower_free_block_when_current_is_at_the_limit() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let project = project();
+        let current = allocation(temp.path(), &project, 59_000);
+        let mut occupied = allocation(temp.path(), &project, 100);
+        occupied.name = "occupied".to_string();
+        occupied.branch = "occupied".to_string();
+        let mut state = State::empty();
+        state
+            .allocations
+            .insert(current.name.clone(), current.clone());
+        state.allocations.insert(occupied.name.clone(), occupied);
+
+        let probe = synthetic_allocation(&state, &current, &project).unwrap();
+
+        assert_eq!(probe.block, 2);
+        assert_eq!(probe.offset, 200);
     }
 
     #[test]

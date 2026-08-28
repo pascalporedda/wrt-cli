@@ -17,6 +17,9 @@ struct Candidate {
 }
 
 pub fn cmd_housekeeping(log: &ui::Logger, repo: &gitx::Repo, apply: bool) -> Result<i32> {
+    let _lock = apply
+        .then(|| crate::worktree::lock_git_operations(&repo.common_dir))
+        .transpose()?;
     let attached = attached_branches(&repo.root)?;
     let current = git_out(&repo.root, &["branch", "--show-current"]).unwrap_or_default();
     let mut candidates = Vec::new();

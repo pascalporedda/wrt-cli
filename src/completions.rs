@@ -17,6 +17,19 @@ mod tests {
         assert!(script.contains("'1:name:_wrt_branches'"));
         assert!(script.contains("path|setup)"));
         assert!(script.contains("env|doctor)"));
+        assert!(script.contains("'runtime[Run a repository-owned runtime command]'"));
+        assert!(script.contains("'actions:action:(start stop status)'"));
+        assert!(script.contains("'2:action:(start stop status)'"));
+        assert!(script.contains("'actions:action:(reset seed migrate)'"));
+        assert!(script.contains("_wrt_db_action"));
+        assert!(script.contains("--worktree=[Explicit worktree name]"));
+        assert!(
+            script
+                .matches("--worktree=[Explicit worktree name]")
+                .count()
+                >= 5
+        );
+        assert!(script.contains("--yes[Skip the reset confirmation]"));
         assert!(script.contains("refs/heads refs/remotes"));
         assert!(script.contains("sub(\"^refs/remotes/[^/]+/\", \"\", name)"));
     }

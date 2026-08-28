@@ -23,7 +23,7 @@ use cli::{Cli, Cmd, RootAction, USAGE_TEXT};
 use cmd::{
     CloneOpts, NewOpts, RootInitOpts, cmd_clone, cmd_db, cmd_doctor, cmd_env, cmd_housekeeping,
     cmd_init, cmd_ls, cmd_new, cmd_path, cmd_prune, cmd_rm, cmd_root_init, cmd_root_status,
-    cmd_run, cmd_setup, raw_run_has_sep,
+    cmd_run, cmd_runtime, cmd_setup, raw_run_has_sep,
 };
 
 fn main() -> ExitCode {
@@ -72,10 +72,10 @@ fn run() -> Result<i32> {
                 source: &source,
                 root: root.as_deref(),
                 main: main.as_deref(),
-                install_mode: &install,
+                install_mode: install.as_str(),
                 sb_mode: supabase,
                 supabase_config: supabase_config.as_deref(),
-                db_mode: &db,
+                db_mode: db.as_str(),
             };
             return cmd_clone(&log, opts);
         }
@@ -95,10 +95,10 @@ fn run() -> Result<i32> {
                 source: &source,
                 root: &root,
                 main: main.as_deref(),
-                install_mode: &install,
+                install_mode: install.as_str(),
                 sb_mode: supabase,
                 supabase_config: supabase_config.as_deref(),
-                db_mode: &db,
+                db_mode: db.as_str(),
             };
             return cmd_root_init(&log, opts);
         }
@@ -139,8 +139,17 @@ fn run() -> Result<i32> {
         Cmd::Init {
             force,
             print,
+            accept_commands,
             model,
-        } => cmd_init(&log, &repo.root, &repo.config_root, force, print, model),
+        } => cmd_init(
+            &log,
+            &repo.root,
+            &repo.config_root,
+            force,
+            print,
+            accept_commands,
+            model,
+        ),
 
         Cmd::Clone { .. } => Ok(0),
 
@@ -166,10 +175,10 @@ fn run() -> Result<i32> {
                 name: &name,
                 from_ref: &from,
                 branch: branch.as_deref(),
-                install_mode: &install,
+                install_mode: install.as_str(),
                 sb_mode: supabase,
                 supabase_config: supabase_config.as_deref(),
-                db_mode: &db,
+                db_mode: db.as_str(),
                 emit_cd: cd,
             };
             cmd_new(&log, &repo, &store, &mut st, opts)
@@ -182,6 +191,7 @@ fn run() -> Result<i32> {
         } => cmd_db(
             &log,
             &repo,
+            &store,
             &st,
             name.as_deref(),
             worktree.as_deref(),
@@ -192,11 +202,25 @@ fn run() -> Result<i32> {
 
         Cmd::Path { name } => cmd_path(&log, &st, &name),
 
-        Cmd::Env { name } => cmd_env(&log, &repo, &st, name.as_deref()),
+        Cmd::Env { name } => cmd_env(&log, &repo, &store, &st, name.as_deref()),
 
         Cmd::Doctor { name } => cmd_doctor(&log, &repo, &st, name.as_deref()),
 
         Cmd::Setup { name } => cmd_setup(&log, &repo, &store, &mut st, &name),
+
+        Cmd::Runtime {
+            name,
+            worktree,
+            action,
+        } => cmd_runtime(
+            &log,
+            &repo,
+            &store,
+            &st,
+            name.as_deref(),
+            worktree.as_deref(),
+            action,
+        ),
 
         Cmd::Rm {
             name,
@@ -213,7 +237,7 @@ fn run() -> Result<i32> {
                 log.errorf("usage: wrt run <name> -- <command> [args...]");
                 return Ok(2);
             }
-            cmd_run(&log, &repo, &st, &name, &command)
+            cmd_run(&log, &repo, &store, &st, &name, &command)
         }
         Cmd::Completions { .. } => Ok(0),
     }

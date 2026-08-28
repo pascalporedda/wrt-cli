@@ -47,6 +47,27 @@ impl ReservationRequest {
             isolated_supabase_ports,
         }
     }
+
+    pub fn compose_probe(project: &ProjectConfig, allocation: &Allocation) -> Result<Self> {
+        let isolated_supabase_ports = allocation
+            .ports
+            .iter()
+            .filter(|(key, _)| key.as_str().starts_with("supabase."))
+            .map(|(key, port)| {
+                let base = i32::from(*port)
+                    .checked_sub(allocation.offset)
+                    .filter(|base| (1..=65535).contains(base))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "cannot reconstruct base port for persisted claim {:?}",
+                            key.as_str()
+                        )
+                    })?;
+                Ok((key.clone(), base as u16))
+            })
+            .collect::<Result<PortAssignments>>()?;
+        Ok(Self::new(Some(project), isolated_supabase_ports))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -139,6 +160,9 @@ pub enum SupabaseAllocation {
 pub struct StateStore {
     common_dir: PathBuf,
     config_root: PathBuf,
+    managed_root: PathBuf,
+    main_worktree: PathBuf,
+    worktree_parent: PathBuf,
 }
 
 impl StateStore {
@@ -146,6 +170,9 @@ impl StateStore {
         Self {
             common_dir: repo.common_dir.clone(),
             config_root: repo.config_root.clone(),
+            managed_root: repo.managed_root.clone(),
+            main_worktree: repo.main_worktree.clone(),
+            worktree_parent: repo.worktree_parent.clone(),
         }
     }
 
@@ -153,7 +180,10 @@ impl StateStore {
         let _lock = StateLock::acquire(&self.common_dir)?;
         let (state, migrated) = self.load_locked()?;
         if migrated {
+            self.validate_external(&state)?;
             self.save_locked(&state)?;
+        } else {
+            self.validate_external(&state)?;
         }
         Ok(state)
     }
@@ -164,11 +194,79 @@ impl StateStore {
         let result = mutate(&mut state)?;
         state.version = CURRENT_VER;
         validate_state(&state)?;
+        self.validate_external(&state)?;
         self.save_locked(&state)?;
         Ok(result)
     }
 
     pub fn lock_allocation(&self, allocation_name: &str) -> Result<AllocationLock> {
+        self.lock_allocation_with(allocation_name, AllocationLockMode::Exclusive)
+    }
+
+    pub fn lock_allocation_shared(&self, allocation_name: &str) -> Result<AllocationLock> {
+        self.lock_allocation_with(allocation_name, AllocationLockMode::Shared)
+    }
+
+    pub fn lock_allocation_read(
+        &self,
+        snapshot: &State,
+        allocation_name: &str,
+    ) -> Result<AllocationReadGuard> {
+        let expected = snapshot
+            .allocations
+            .get(allocation_name)
+            .ok_or_else(|| anyhow!("unknown worktree: {allocation_name:?}"))?;
+        let expected_generation = expected.generation_id;
+        let expected_supabase = expected.supabase.clone();
+        let expected_owner = match &expected.supabase {
+            SupabaseAllocation::Shared { owner } => Some((
+                owner.clone(),
+                snapshot
+                    .allocations
+                    .get(owner)
+                    .ok_or_else(|| anyhow!("shared Supabase owner is missing: {owner:?}"))?
+                    .generation_id,
+            )),
+            _ => None,
+        };
+        let selected_lock = self.lock_allocation_shared(allocation_name)?;
+        let owner_lock = expected_owner
+            .as_ref()
+            .map(|(owner, _)| self.lock_allocation_shared(owner))
+            .transpose()?;
+        let state = self.read()?;
+        state
+            .allocations
+            .get(allocation_name)
+            .filter(|allocation| {
+                allocation.generation_id == expected_generation
+                    && allocation.supabase == expected_supabase
+            })
+            .ok_or_else(|| anyhow!("worktree was removed or replaced: {allocation_name:?}"))?;
+        if let Some((owner, generation)) = expected_owner {
+            state
+                .allocations
+                .get(&owner)
+                .filter(|allocation| {
+                    allocation.generation_id == generation
+                        && matches!(allocation.supabase, SupabaseAllocation::Owned { .. })
+                })
+                .ok_or_else(|| {
+                    anyhow!("shared Supabase owner was removed or replaced: {owner:?}")
+                })?;
+        }
+        Ok(AllocationReadGuard {
+            _selected_lock: selected_lock,
+            _owner_lock: owner_lock,
+            state,
+        })
+    }
+
+    fn lock_allocation_with(
+        &self,
+        allocation_name: &str,
+        mode: AllocationLockMode,
+    ) -> Result<AllocationLock> {
         if crate::worktree::slug(allocation_name) != allocation_name {
             bail!("invalid allocation lock name {allocation_name:?}");
         }
@@ -186,8 +284,11 @@ impl StateStore {
             .write(true)
             .open(&path)
             .with_context(|| format!("open {}", path.display()))?;
-        file.lock_exclusive()
-            .with_context(|| format!("lock {}", path.display()))?;
+        match mode {
+            AllocationLockMode::Shared => FileExt::lock_shared(&file),
+            AllocationLockMode::Exclusive => FileExt::lock_exclusive(&file),
+        }
+        .with_context(|| format!("lock {}", path.display()))?;
         Ok(AllocationLock { _file: file })
     }
 
@@ -209,10 +310,11 @@ impl StateStore {
 
         match version {
             4 => {
-                let state: State = serde_json::from_value(value)
+                let mut state: State = serde_json::from_value(value)
                     .with_context(|| format!("parse state version 4 from {}", path.display()))?;
+                let repaired = repair_legacy_shared_owners(&mut state)?;
                 validate_state(&state)?;
-                Ok((state, false))
+                Ok((state, repaired))
             }
             3 => {
                 let state: StateV3 = serde_json::from_value(value)
@@ -231,6 +333,38 @@ impl StateStore {
             bail!("expected state version 3 during migration");
         }
 
+        let primary_by_path = old.root.as_ref().and_then(|root| {
+            let primary = Path::new(&root.main_worktree);
+            let matches = old
+                .allocations
+                .iter()
+                .filter(|(_, allocation)| paths_match(Path::new(&allocation.path), primary))
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [key] => Some(*key),
+                _ => None,
+            }
+        });
+        let block_zero = old
+            .allocations
+            .iter()
+            .filter(|(_, allocation)| allocation.block == 0)
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>();
+        let primary_key = primary_by_path.or(match block_zero.as_slice() {
+            [key] => Some(*key),
+            _ => None,
+        });
+        if let Some(primary_key) = primary_key {
+            let primary = &old.allocations[primary_key];
+            if !Path::new(&primary.path).exists() {
+                bail!(
+                    "cannot migrate state version 3 because the primary worktree {} is missing; repair it or recreate the managed root",
+                    primary.path
+                );
+            }
+        }
         let mut allocations = BTreeMap::new();
         for (key, allocation) in old.allocations {
             let checkout = Path::new(&allocation.path);
@@ -276,15 +410,80 @@ impl StateStore {
             );
         }
 
-        let state = State {
+        let mut state = State {
             version: CURRENT_VER,
             root: old.root,
             allocations,
         };
+        repair_legacy_shared_owners(&mut state)?;
         validate_state(&state).with_context(|| {
             "state version 3 cannot be migrated safely; recreate the conflicting worktree allocations"
         })?;
         Ok(state)
+    }
+
+    fn validate_external(&self, state: &State) -> Result<()> {
+        let Some(root) = &state.root else {
+            return Ok(());
+        };
+        if root.layout != LAYOUT_MANAGED_ROOT
+            || !paths_match(Path::new(&root.managed_root), &self.managed_root)
+            || !paths_match(Path::new(&root.git_common_dir), &self.common_dir)
+            || !paths_match(Path::new(&root.main_worktree), &self.main_worktree)
+            || !paths_match(Path::new(&root.worktrees_path), &self.worktree_parent)
+        {
+            bail!("state managed-root metadata does not match the detected Git repository");
+        }
+
+        let primary_count = state
+            .allocations
+            .values()
+            .filter(|allocation| paths_match(Path::new(&allocation.path), &self.main_worktree))
+            .count();
+        let detached_without_primary = primary_count == 0
+            && !self.main_worktree.exists()
+            && state
+                .allocations
+                .values()
+                .all(|allocation| allocation.block != 0);
+        if primary_count != 1 && !detached_without_primary {
+            bail!("state primary worktree must resolve to exactly one allocation");
+        }
+
+        let lexical_parent = lexical_absolute(&self.worktree_parent)?;
+        let canonical_parent = fs::canonicalize(&self.worktree_parent).with_context(|| {
+            format!("resolve worktrees path {}", self.worktree_parent.display())
+        })?;
+        for (key, allocation) in &state.allocations {
+            let path = Path::new(&allocation.path);
+            let lexical_path = lexical_absolute(path)?;
+            if !lexical_path.starts_with(&lexical_parent) {
+                bail!("allocation {key:?} path is outside worktreesPath");
+            }
+            match fs::canonicalize(path) {
+                Ok(canonical) if !canonical.starts_with(&canonical_parent) => {
+                    bail!("allocation {key:?} path resolves outside worktreesPath")
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| format!("resolve allocation {key:?} path"));
+                }
+            }
+            if let SupabaseAllocation::Shared { owner } = &allocation.supabase {
+                let owner = state.allocations.get(owner).ok_or_else(|| {
+                    anyhow!("allocation {key:?} references missing shared Supabase owner {owner:?}")
+                })?;
+                if !matches!(owner.supabase, SupabaseAllocation::Owned { .. })
+                    || owner.generation_id == allocation.generation_id
+                    || owner.path == allocation.path
+                    || !Path::new(&owner.path).is_dir()
+                {
+                    bail!("allocation {key:?} has an invalid shared Supabase owner {owner:?}");
+                }
+            }
+        }
+        Ok(())
     }
 
     fn save_locked(&self, state: &State) -> Result<()> {
@@ -319,6 +518,28 @@ pub struct AllocationLock {
     _file: File,
 }
 
+pub struct AllocationReadGuard {
+    _selected_lock: AllocationLock,
+    _owner_lock: Option<AllocationLock>,
+    state: State,
+}
+
+impl AllocationReadGuard {
+    pub fn state(&self) -> &State {
+        &self.state
+    }
+
+    pub fn allocation(&self, name: &str) -> &Allocation {
+        &self.state.allocations[name]
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AllocationLockMode {
+    Shared,
+    Exclusive,
+}
+
 impl State {
     pub fn empty() -> State {
         State {
@@ -337,7 +558,7 @@ impl State {
             let primary_path = Path::new(&root.main_worktree);
             self.allocations
                 .iter()
-                .find(|(_, allocation)| Path::new(&allocation.path) == primary_path)
+                .find(|(_, allocation)| paths_match(Path::new(&allocation.path), primary_path))
         });
 
         by_path
@@ -354,8 +575,9 @@ impl State {
     }
 
     pub fn is_primary_allocation(&self, allocation: &Allocation) -> bool {
-        self.primary_allocation()
-            .is_some_and(|(_, primary)| primary.path == allocation.path)
+        self.primary_allocation().is_some_and(|(_, primary)| {
+            paths_match(Path::new(&primary.path), Path::new(&allocation.path))
+        })
     }
 
     pub fn allocation_mut_if_generation(
@@ -531,8 +753,54 @@ fn validate_state(state: &State) -> Result<()> {
                 }
             }
         }
+        if let SupabaseAllocation::Shared { owner } = &allocation.supabase {
+            let owner_allocation = state.allocations.get(owner).ok_or_else(|| {
+                anyhow!(
+                    "allocation {allocation_key:?} references missing shared Supabase owner {owner:?}"
+                )
+            })?;
+            if !matches!(owner_allocation.supabase, SupabaseAllocation::Owned { .. })
+                || owner_allocation.path == allocation.path
+                || owner_allocation.generation_id == allocation.generation_id
+            {
+                bail!("allocation {allocation_key:?} has invalid shared Supabase owner {owner:?}");
+            }
+        }
     }
     Ok(())
+}
+
+fn repair_legacy_shared_owners(state: &mut State) -> Result<bool> {
+    let Some(primary_key) = state.primary_allocation_key().map(str::to_string) else {
+        return Ok(false);
+    };
+    if !matches!(
+        state
+            .allocations
+            .get(&primary_key)
+            .map(|allocation| &allocation.supabase),
+        Some(SupabaseAllocation::Owned { .. })
+    ) {
+        return Ok(false);
+    }
+    let legacy_main_is_not_owner = !matches!(
+        state
+            .allocations
+            .get("main")
+            .map(|allocation| &allocation.supabase),
+        Some(SupabaseAllocation::Owned { .. })
+    );
+    let mut repaired = false;
+    for allocation in state.allocations.values_mut() {
+        if let SupabaseAllocation::Shared { owner } = &mut allocation.supabase
+            && owner == "main"
+            && legacy_main_is_not_owner
+        {
+            *owner = primary_key.clone();
+            repaired = true;
+        }
+    }
+    Ok(repaired)
 }
 
 fn validate_assignment_values(assignments: &PortAssignments) -> Result<()> {
@@ -559,6 +827,52 @@ fn migration_recreate_message(allocation: &str) -> String {
     format!(
         "cannot migrate allocation {allocation:?} to state version 4; recreate the affected worktree"
     )
+}
+
+fn paths_match(first: &Path, second: &Path) -> bool {
+    match (
+        canonicalize_allow_missing(first),
+        canonicalize_allow_missing(second),
+    ) {
+        (Ok(first), Ok(second)) => first == second,
+        _ => lexical_absolute(first).ok() == lexical_absolute(second).ok(),
+    }
+}
+
+fn canonicalize_allow_missing(path: &Path) -> Result<PathBuf> {
+    if path.exists() {
+        return fs::canonicalize(path).with_context(|| format!("resolve {}", path.display()));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("path has no file name: {}", path.display()))?;
+    Ok(fs::canonicalize(parent)
+        .with_context(|| format!("resolve {}", parent.display()))?
+        .join(name))
+}
+
+fn lexical_absolute(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        bail!("state path must be absolute: {}", path.display());
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    bail!("state path escapes its root: {}", path.display());
+                }
+            }
+            std::path::Component::Normal(part) => normalized.push(part),
+        }
+    }
+    Ok(normalized)
 }
 
 struct StateLock {
@@ -759,6 +1073,91 @@ mod tests {
     }
 
     #[test]
+    fn migration_matches_equivalent_primary_path_spellings() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = repo(temp.path());
+        fs::create_dir_all(repo.common_dir.join(STATE_DIR_NAME)).unwrap();
+        fs::create_dir_all(&repo.main_worktree).unwrap();
+        let spelled = repo.main_worktree.join("..").join("main");
+        fs::write(
+            file_path(&repo.common_dir),
+            format!(
+                r#"{{"version":3,"root":{{"layout":"managed-root","managedRoot":{:?},"gitCommonDir":{:?},"mainWorktree":{:?},"worktreesPath":{:?},"createdAt":"now"}},"allocations":{{"primary":{{"name":"primary","branch":"main","path":{:?},"block":7,"offset":700,"status":"active","createdAt":"now"}}}}}}"#,
+                temp.path().to_string_lossy(),
+                repo.common_dir.to_string_lossy(),
+                repo.main_worktree.to_string_lossy(),
+                temp.path().to_string_lossy(),
+                spelled.to_string_lossy(),
+            ),
+        )
+        .unwrap();
+
+        let state = StateStore::new(&repo).read().unwrap();
+
+        assert!(state.allocations.contains_key("primary"));
+        assert_eq!(state.primary_allocation_key(), Some("primary"));
+    }
+
+    #[test]
+    fn migration_repairs_legacy_main_owner_to_non_main_primary() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = repo(temp.path());
+        let primary = &repo.main_worktree;
+        let feature = temp.path().join("feature");
+        fs::create_dir_all(repo.common_dir.join(STATE_DIR_NAME)).unwrap();
+        fs::create_dir_all(primary.join("supabase")).unwrap();
+        fs::create_dir_all(&feature).unwrap();
+        fs::write(
+            primary.join("supabase/config.toml"),
+            "project_id = \"primary\"\n",
+        )
+        .unwrap();
+        fs::write(
+            file_path(&repo.common_dir),
+            format!(
+                r#"{{"version":3,"root":{{"layout":"managed-root","managedRoot":{:?},"gitCommonDir":{:?},"mainWorktree":{:?},"worktreesPath":{:?},"createdAt":"now"}},"allocations":{{"staging":{{"name":"staging","branch":"main","path":{:?},"block":0,"offset":0,"status":"active","createdAt":"now","supabase":{{"mode":"owned","projectId":"primary","configPath":"supabase/config.toml"}}}},"feature":{{"name":"feature","branch":"feature","path":{:?},"block":1,"offset":100,"status":"active","createdAt":"now","supabase":{{"mode":"shared","owner":"main"}}}}}}}}"#,
+                temp.path().to_string_lossy(),
+                repo.common_dir.to_string_lossy(),
+                primary.to_string_lossy(),
+                temp.path().to_string_lossy(),
+                primary.to_string_lossy(),
+                feature.to_string_lossy(),
+            ),
+        )
+        .unwrap();
+
+        let state = StateStore::new(&repo).read().unwrap();
+
+        assert_eq!(state.primary_allocation_key(), Some("staging"));
+        assert_eq!(
+            state.allocations["feature"].supabase,
+            SupabaseAllocation::Shared {
+                owner: "staging".to_string()
+            }
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(file_path(&repo.common_dir)).unwrap()).unwrap();
+        assert_eq!(
+            saved["allocations"]["feature"]["supabase"]["owner"],
+            "staging"
+        );
+    }
+
+    #[test]
+    fn compose_probe_allows_large_offsets_when_there_are_no_supabase_claims() {
+        let config = project_config(
+            r#"{"version":2,"port_stride":1,"ports":[{"key":"api","base_port":3000}]}"#,
+        );
+        let mut allocation = allocation("feature", 70000);
+        allocation.offset = 70000;
+
+        let request = ReservationRequest::compose_probe(&config, &allocation).unwrap();
+        let reservation = reserve_ports(&State::empty(), &request).unwrap();
+
+        assert_eq!(reservation.ports.values().next(), Some(&3001));
+    }
+
+    #[test]
     fn migration_keeps_owned_supabase_config_ports_concrete() {
         let temp = tempfile::TempDir::new().unwrap();
         let repo = repo(temp.path());
@@ -813,6 +1212,54 @@ mod tests {
         let saved: serde_json::Value =
             serde_json::from_slice(&fs::read(file_path(&repo.common_dir)).unwrap()).unwrap();
         assert_eq!(saved["allocations"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn migration_refuses_to_discard_a_missing_primary_and_does_not_persist() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = repo(temp.path());
+        fs::create_dir_all(repo.common_dir.join(STATE_DIR_NAME)).unwrap();
+        let original = format!(
+            r#"{{"version":3,"root":{{"layout":"managed-root","managedRoot":{:?},"gitCommonDir":{:?},"mainWorktree":{:?},"worktreesPath":{:?},"createdAt":"now"}},"allocations":{{"main":{{"name":"main","branch":"main","path":{:?},"block":0,"offset":0,"status":"active","createdAt":"now"}}}}}}"#,
+            temp.path().to_string_lossy(),
+            repo.common_dir.to_string_lossy(),
+            repo.main_worktree.to_string_lossy(),
+            temp.path().to_string_lossy(),
+            repo.main_worktree.to_string_lossy(),
+        );
+        fs::write(file_path(&repo.common_dir), &original).unwrap();
+
+        let error = StateStore::new(&repo).read().unwrap_err().to_string();
+        assert!(error.contains("primary worktree"), "{error}");
+        assert!(error.contains("repair it or recreate"), "{error}");
+        assert_eq!(
+            fs::read_to_string(file_path(&repo.common_dir)).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn migration_uses_unique_block_zero_as_primary_fallback() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = repo(temp.path());
+        fs::create_dir_all(repo.common_dir.join(STATE_DIR_NAME)).unwrap();
+        let original = format!(
+            r#"{{"version":3,"root":{{"layout":"managed-root","managedRoot":{:?},"gitCommonDir":{:?},"mainWorktree":{:?},"worktreesPath":{:?},"createdAt":"now"}},"allocations":{{"primary":{{"name":"primary","branch":"main","path":{:?},"block":0,"offset":0,"status":"active","createdAt":"now"}}}}}}"#,
+            temp.path().to_string_lossy(),
+            repo.common_dir.to_string_lossy(),
+            repo.main_worktree.to_string_lossy(),
+            temp.path().to_string_lossy(),
+            temp.path().join("missing-primary").to_string_lossy(),
+        );
+        fs::write(file_path(&repo.common_dir), &original).unwrap();
+
+        let error = StateStore::new(&repo).read().unwrap_err().to_string();
+
+        assert!(error.contains("primary worktree"), "{error}");
+        assert_eq!(
+            fs::read_to_string(file_path(&repo.common_dir)).unwrap(),
+            original
+        );
     }
 
     #[test]
@@ -918,6 +1365,124 @@ mod tests {
         drop(held);
         receiver.recv_timeout(Duration::from_secs(1)).unwrap();
         waiter.join().unwrap();
+    }
+
+    #[test]
+    fn shared_lifecycle_locks_allow_runtime_commands_and_block_cleanup() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = StateStore::new(&repo(temp.path()));
+        let first = store.lock_allocation_shared("feature").unwrap();
+        let (shared_sender, shared_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let shared_store = store.clone();
+        let shared = thread::spawn(move || {
+            let _lock = shared_store.lock_allocation_shared("feature").unwrap();
+            shared_sender.send(()).unwrap();
+            release_receiver.recv().unwrap();
+        });
+        shared_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        let (exclusive_sender, exclusive_receiver) = mpsc::channel();
+        let exclusive_store = store.clone();
+        let exclusive = thread::spawn(move || {
+            let _lock = exclusive_store.lock_allocation("feature").unwrap();
+            exclusive_sender.send(()).unwrap();
+        });
+        assert!(
+            exclusive_receiver
+                .recv_timeout(Duration::from_millis(50))
+                .is_err()
+        );
+        drop(first);
+        assert!(
+            exclusive_receiver
+                .recv_timeout(Duration::from_millis(50))
+                .is_err()
+        );
+        release_sender.send(()).unwrap();
+        exclusive_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        shared.join().unwrap();
+        exclusive.join().unwrap();
+    }
+
+    #[test]
+    fn allocation_read_guard_holds_selected_and_shared_owner_locks() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = StateStore::new(&repo(temp.path()));
+        store
+            .update(|state| {
+                let mut owner = allocation("owner", 0);
+                owner.supabase = SupabaseAllocation::Owned {
+                    project_id: "owner-project".to_string(),
+                    config_path: "supabase/config.toml".to_string(),
+                };
+                let mut client = allocation("client", 1);
+                client.supabase = SupabaseAllocation::Shared {
+                    owner: "owner".to_string(),
+                };
+                state.allocations.insert("owner".to_string(), owner);
+                state.allocations.insert("client".to_string(), client);
+                Ok(())
+            })
+            .unwrap();
+        let snapshot = store.read().unwrap();
+        let guard = store.lock_allocation_read(&snapshot, "client").unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let waiting_store = store.clone();
+        let waiter = thread::spawn(move || {
+            let _lock = waiting_store.lock_allocation("owner").unwrap();
+            sender.send(()).unwrap();
+        });
+
+        assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(guard);
+        receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn allocation_read_guard_rechecks_selected_and_owner_generations() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = StateStore::new(&repo(temp.path()));
+        store
+            .update(|state| {
+                let mut owner = allocation("owner", 0);
+                owner.supabase = SupabaseAllocation::Owned {
+                    project_id: "owner-project".to_string(),
+                    config_path: "supabase/config.toml".to_string(),
+                };
+                let mut client = allocation("client", 1);
+                client.supabase = SupabaseAllocation::Shared {
+                    owner: "owner".to_string(),
+                };
+                state.allocations.insert("owner".to_string(), owner);
+                state.allocations.insert("client".to_string(), client);
+                Ok(())
+            })
+            .unwrap();
+        let stale_client = store.read().unwrap();
+        store
+            .update(|state| {
+                state.allocations.get_mut("client").unwrap().generation_id =
+                    AllocationGeneration::new();
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.lock_allocation_read(&stale_client, "client").is_err());
+
+        let stale_owner = store.read().unwrap();
+        store
+            .update(|state| {
+                state.allocations.get_mut("owner").unwrap().generation_id =
+                    AllocationGeneration::new();
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.lock_allocation_read(&stale_owner, "client").is_err());
     }
 
     #[test]

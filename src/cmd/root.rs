@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::cli::RootSupabaseMode;
-use crate::cmd::new::{SetupModes, setup_existing_worktree};
+use crate::cmd::setup::{SetupModes, setup_existing_worktree};
 use crate::gitx;
 use crate::project::ProjectConfig;
 use crate::state::{
@@ -13,7 +13,7 @@ use crate::state::{
 };
 use crate::supabase;
 use crate::ui;
-use crate::util::run_cmd;
+use crate::util::{atomic_copy_private, run_cmd};
 use crate::worktree;
 
 pub struct RootInitOpts<'a> {
@@ -91,12 +91,14 @@ pub fn cmd_root_init(log: &ui::Logger, opts: RootInitOpts<'_>) -> Result<i32> {
         log.errorf(&format!("{} already exists", git_dir.display()));
         return Ok(2);
     }
-    if root.exists() && fs::read_dir(&root)?.next().is_some() {
+    let root_existed = root.exists();
+    if root_existed && fs::read_dir(&root)?.next().is_some() {
         log.errorf(&format!("{} is not empty", root.display()));
         return Ok(2);
     }
 
     fs::create_dir_all(&root).with_context(|| format!("mkdir {}", root.display()))?;
+    let mut cleanup = RootInitCleanup::new(root.clone(), git_dir.clone(), !root_existed);
 
     log.infof(&format!(
         "cloning bare repo: {} -> {}",
@@ -134,26 +136,24 @@ pub fn cmd_root_init(log: &ui::Logger, opts: RootInitOpts<'_>) -> Result<i32> {
         None => default_branch(&git_dir).unwrap_or_else(|| "main".to_string()),
     };
     let main_path = root.join(worktree::slug(&branch));
+    cleanup.main_path = Some(main_path.clone());
 
     log.infof(&format!(
         "creating main worktree: {} ({branch})",
         main_path.display()
     ));
-    let main_path_arg = main_path.to_string_lossy().to_string();
-    let add_args = [
-        "--git-dir",
-        git_dir_arg.as_str(),
-        "worktree",
-        "add",
-        main_path_arg.as_str(),
-        branch.as_str(),
-    ];
-    if let Err(e) = run_cmd(Path::new("."), "git", &add_args) {
+    if let Err(e) = worktree::add_existing(&git_dir, &main_path, &branch) {
         log.errorf(&format!("git worktree add main failed: {e}"));
         return Ok(1);
     }
 
-    copy_source_overlays(&source, &root, &main_path);
+    match copy_source_overlays(&source, &root, &main_path) {
+        Ok(created) => cleanup.created_files = created,
+        Err(error) => {
+            log.errorf(&format!("copy source files failed: {error:#}"));
+            return Ok(1);
+        }
+    }
 
     let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let has_supabase = supabase::has_config(&main_path, &target);
@@ -242,6 +242,7 @@ pub fn cmd_root_init(log: &ui::Logger, opts: RootInitOpts<'_>) -> Result<i32> {
         state.allocations.insert(primary_key.clone(), alloc);
         Ok(())
     })?;
+    cleanup.persisted = true;
     let mut st = store.read()?;
     let _ = gitx::ensure_info_exclude(&git_dir, &[".env", ".env.local", ".wrt.env", ".wrt.json"]);
 
@@ -382,20 +383,68 @@ fn default_branch(git_dir: &Path) -> Option<String> {
         })
 }
 
-fn copy_source_overlays(source_path: &Path, managed_root: &Path, main_path: &Path) {
+fn copy_source_overlays(
+    source_path: &Path,
+    managed_root: &Path,
+    main_path: &Path,
+) -> Result<Vec<std::path::PathBuf>> {
+    let mut created = Vec::new();
     if !source_path.is_dir() {
-        return;
+        return Ok(created);
     }
     let env_src = source_path.join(".env");
     let env_dst = main_path.join(".env");
-    if env_src.is_file() && !env_dst.exists() {
-        let _ = fs::copy(env_src, env_dst);
+    if env_src.exists() && !env_dst.exists() {
+        atomic_copy_private(source_path, &env_src, main_path, &env_dst)?;
+        created.push(env_dst);
     }
 
     let config_src = source_path.join(".wrt.json");
     let config_dst = managed_root.join(".wrt.json");
-    if config_src.is_file() && !config_dst.exists() {
-        let _ = fs::copy(config_src, config_dst);
+    if config_src.exists() && !config_dst.exists() {
+        atomic_copy_private(source_path, &config_src, managed_root, &config_dst)?;
+        created.push(config_dst);
+    }
+    Ok(created)
+}
+
+struct RootInitCleanup {
+    root: std::path::PathBuf,
+    git_dir: std::path::PathBuf,
+    root_created: bool,
+    created_files: Vec<std::path::PathBuf>,
+    main_path: Option<std::path::PathBuf>,
+    persisted: bool,
+}
+
+impl RootInitCleanup {
+    fn new(root: std::path::PathBuf, git_dir: std::path::PathBuf, root_created: bool) -> Self {
+        Self {
+            root,
+            git_dir,
+            root_created,
+            created_files: Vec::new(),
+            main_path: None,
+            persisted: false,
+        }
+    }
+}
+
+impl Drop for RootInitCleanup {
+    fn drop(&mut self) {
+        if self.persisted {
+            return;
+        }
+        for path in &self.created_files {
+            let _ = fs::remove_file(path);
+        }
+        if let Some(main_path) = &self.main_path {
+            let _ = fs::remove_dir_all(main_path);
+        }
+        let _ = fs::remove_dir_all(&self.git_dir);
+        if self.root_created {
+            let _ = fs::remove_dir(&self.root);
+        }
     }
 }
 

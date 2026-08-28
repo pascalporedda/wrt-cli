@@ -2,6 +2,8 @@ use predicates::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
+use std::thread;
+use std::time::Duration;
 use tempfile::TempDir;
 
 fn git(dir: &Path, args: &[&str]) {
@@ -89,6 +91,96 @@ fn init_managed_from(source: TempDir) -> (TempDir, TempDir) {
     set_minimal_path(&mut cmd);
     cmd.assert().success();
     (source, root)
+}
+
+#[test]
+fn managed_root_configures_shared_git_hooks_path() {
+    let (_source, root) = init_managed_repo();
+    let git_dir = root.path().join(".git");
+    let hooks_path = git_out(
+        root.path(),
+        &[
+            "--git-dir",
+            git_dir.to_str().unwrap(),
+            "config",
+            "--local",
+            "--get",
+            "core.hooksPath",
+        ],
+    );
+
+    assert_eq!(
+        fs::canonicalize(Path::new(hooks_path.trim())).unwrap(),
+        fs::canonicalize(root.path().join(".git/hooks")).unwrap()
+    );
+
+    git(
+        root.path(),
+        &[
+            "--git-dir",
+            git_dir.to_str().unwrap(),
+            "config",
+            "--local",
+            "--unset-all",
+            "core.hooksPath",
+        ],
+    );
+    wrt_cmd()
+        .current_dir(root.path())
+        .args(["setup", "main"])
+        .assert()
+        .success();
+    let repaired_hooks_path = git_out(
+        root.path(),
+        &[
+            "--git-dir",
+            git_dir.to_str().unwrap(),
+            "config",
+            "--local",
+            "--get",
+            "core.hooksPath",
+        ],
+    );
+    assert_eq!(
+        fs::canonicalize(Path::new(repaired_hooks_path.trim())).unwrap(),
+        fs::canonicalize(root.path().join(".git/hooks")).unwrap()
+    );
+}
+
+#[test]
+fn setup_preserves_custom_git_hooks_path() {
+    let (_source, root) = init_managed_repo();
+    let custom_hooks = root.path().join("custom-hooks");
+    git(
+        root.path(),
+        &[
+            "--git-dir",
+            root.path().join(".git").to_str().unwrap(),
+            "config",
+            "--local",
+            "core.hooksPath",
+            custom_hooks.to_str().unwrap(),
+        ],
+    );
+
+    wrt_cmd()
+        .current_dir(root.path())
+        .args(["setup", "main"])
+        .assert()
+        .success();
+
+    let hooks_path = git_out(
+        root.path(),
+        &[
+            "--git-dir",
+            root.path().join(".git").to_str().unwrap(),
+            "config",
+            "--local",
+            "--get",
+            "core.hooksPath",
+        ],
+    );
+    assert_eq!(Path::new(hooks_path.trim()), custom_hooks);
 }
 
 fn init_bare_managed_without_main() -> (TempDir, TempDir) {
@@ -226,7 +318,12 @@ case "$1" in
     ;;
   start)
     if [ -n "${EXPECT_WRT_ENV:-}" ]; then test -f "$EXPECT_WRT_ENV" || exit 31; fi
+    if [ -n "${MOCK_START_LOCK_DIR:-}" ]; then
+      mkdir "$MOCK_START_LOCK_DIR" || exit 73
+      sleep 0.1
+    fi
     touch .mock_supabase_started
+    if [ -n "${MOCK_START_LOCK_DIR:-}" ]; then rmdir "$MOCK_START_LOCK_DIR"; fi
     ;;
   stop) rm -f .mock_supabase_started ;;
 esac
@@ -241,6 +338,9 @@ fn write_mock_docker(dir: &Path) {
         "docker",
         r#"#!/bin/sh
 set -eu
+if [ -n "${MOCK_DOCKER_LOG:-}" ]; then
+  printf 'docker %s\n' "$*" >> "$MOCK_DOCKER_LOG"
+fi
 if [ "${MOCK_DOCKER_MODE:-safe}" = fail ]; then
   printf 'mock render failed\n' >&2
   exit 19
@@ -252,6 +352,56 @@ fi
 printf '{"services":{"redis":{"ports":[{"protocol":"tcp","published":"%s","target":6379}]},"postgres":{"ports":[{"protocol":"tcp","published":"%s","target":5432}]}}}\n' "$REDIS_PORT" "$POSTGRES_PORT"
 "#,
     );
+}
+
+#[cfg(unix)]
+fn runtime_source() -> TempDir {
+    let source = init_repo();
+    fs::create_dir(source.path().join("scripts")).unwrap();
+    fs::write(
+        source.path().join(".wrt.json"),
+        complete_v2_config(
+            r#"{
+  "version":2,
+  "port_stride":100,
+  "ports":[
+    {"key":"postgres","base_port":5432,"outputs":[{"env":"POSTGRES_PORT","template":"{port}"}]},
+    {"key":"redis","base_port":6379,"outputs":[{"env":"REDIS_PORT","template":"{port}"}]}
+  ],
+  "commands":{
+    "start":{"argv":["sh","runtime.sh","start"],"cwd":"scripts"},
+    "stop":{"argv":["sh","runtime.sh","stop"],"cwd":"scripts"},
+    "status":{"argv":["sh","runtime.sh","status"],"cwd":"scripts"}
+  },
+  "compose":{"files":["compose.yaml"]}
+}"#,
+        ),
+    )
+    .unwrap();
+    fs::write(
+        source.path().join("compose.yaml"),
+        "services:\n  postgres:\n    image: postgres\n    ports:\n      - \"${POSTGRES_PORT}:5432\"\n  redis:\n    image: redis\n    ports:\n      - \"${REDIS_PORT}:6379\"\n",
+    )
+    .unwrap();
+    fs::write(
+        source.path().join("scripts/runtime.sh"),
+        "#!/bin/sh\nset -eu\nprintf '%s|%s|%s|%s|%s|%s\\n' \"$1\" \"$PWD\" \"$WRT_NAME\" \"$COMPOSE_PROJECT_NAME\" \"$POSTGRES_PORT\" \"$REDIS_PORT\" >> \"$RUNTIME_LOG\"\nif [ \"$1\" = start ] && [ -n \"${RUNTIME_START_BLOCK_FILE:-}\" ]; then\n  : > \"${RUNTIME_START_READY_FILE:-$RUNTIME_START_BLOCK_FILE.ready}\"\n  while [ -f \"$RUNTIME_START_BLOCK_FILE\" ]; do\n    sleep 1\n  done\nfi\nif [ \"$1\" = status ]; then exit \"${RUNTIME_STATUS_CODE:-0}\"; fi\n",
+    )
+    .unwrap();
+    git(source.path(), &["add", "."]);
+    git(
+        source.path(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-m",
+            "add runtime project",
+        ],
+    );
+    source
 }
 
 #[cfg(unix)]
@@ -345,6 +495,20 @@ fn commands_require_managed_root() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains("not a wrt managed root"));
+}
+
+#[test]
+fn runtime_requires_an_action() {
+    let td = TempDir::new().unwrap();
+
+    wrt_cmd()
+        .current_dir(td.path())
+        .arg("runtime")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "Usage: wrt runtime [OPTIONS] [NAME] <COMMAND>",
+        ));
 }
 
 #[cfg(unix)]
@@ -497,7 +661,6 @@ fn compose_config_without_project_setup_keeps_the_legacy_path_out_of_preflight()
         ])
         .assert()
         .success();
-
     wrt_cmd()
         .current_dir(managed.path())
         .env("PATH", &path)
@@ -516,6 +679,305 @@ fn compose_config_without_project_setup_keeps_the_legacy_path_out_of_preflight()
         .success();
 
     assert!(!docker_log.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_infers_current_worktree_selects_explicit_worktree_and_preserves_state() {
+    let source = runtime_source();
+    let bin = TempDir::new().unwrap();
+    write_mock_docker(bin.path());
+    let managed = init_compose_managed(&source, bin.path());
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+    let runtime_log = bin.path().join("runtime.log");
+    let docker_log = bin.path().join("docker.log");
+
+    wrt_cmd()
+        .current_dir(managed.path())
+        .env("PATH", &path)
+        .args([
+            "new",
+            "feature",
+            "--install",
+            "false",
+            "--supabase",
+            "none",
+            "--db",
+            "false",
+        ])
+        .assert()
+        .success();
+    wrt_cmd()
+        .current_dir(managed.path())
+        .env("PATH", &path)
+        .args([
+            "new",
+            "start",
+            "--install",
+            "false",
+            "--supabase",
+            "none",
+            "--db",
+            "false",
+        ])
+        .assert()
+        .success();
+
+    let state_path = managed.path().join(".git/.wrt/state.json");
+    fs::create_dir_all(main_path(&managed).join("supabase")).unwrap();
+    fs::write(
+        main_path(&managed).join("supabase/config.toml"),
+        "project_id = \"main\"\n",
+    )
+    .unwrap();
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    state["allocations"]["main"]["supabase"] = serde_json::json!({
+        "mode": "owned",
+        "projectId": "main",
+        "configPath": "supabase/config.toml"
+    });
+    state["allocations"]["feature"]["supabase"] = serde_json::json!({
+        "mode": "shared",
+        "owner": "main"
+    });
+    fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+    let state_before = fs::read(&state_path).unwrap();
+    let state: serde_json::Value = serde_json::from_slice(&state_before).unwrap();
+
+    wrt_cmd()
+        .current_dir(main_path(&managed).join("scripts"))
+        .env("PATH", &path)
+        .env("RUNTIME_LOG", &runtime_log)
+        .env("MOCK_DOCKER_LOG", &docker_log)
+        .args(["runtime", "start"])
+        .assert()
+        .success();
+
+    wrt_cmd()
+        .current_dir(managed.path())
+        .env("PATH", &path)
+        .env("RUNTIME_LOG", &runtime_log)
+        .env("MOCK_DOCKER_LOG", &docker_log)
+        .env("MOCK_DOCKER_MODE", "fail")
+        .env("RUNTIME_STATUS_CODE", "37")
+        .args(["runtime", "feature", "status"])
+        .assert()
+        .code(37);
+
+    for _ in 0..2 {
+        wrt_cmd()
+            .current_dir(managed.path())
+            .env("PATH", &path)
+            .env("RUNTIME_LOG", &runtime_log)
+            .env("MOCK_DOCKER_LOG", &docker_log)
+            .env("MOCK_DOCKER_MODE", "fail")
+            .args(["runtime", "feature", "stop"])
+            .assert()
+            .success();
+    }
+    wrt_cmd()
+        .current_dir(managed.path())
+        .env("PATH", &path)
+        .env("RUNTIME_LOG", &runtime_log)
+        .env("MOCK_DOCKER_LOG", &docker_log)
+        .env("MOCK_DOCKER_MODE", "fail")
+        .args(["runtime", "feature", "--worktree", "start", "stop"])
+        .assert()
+        .success();
+
+    assert_eq!(fs::read(&state_path).unwrap(), state_before);
+    assert_eq!(fs::read_to_string(&docker_log).unwrap().lines().count(), 2);
+
+    let lines = fs::read_to_string(runtime_log).unwrap();
+    let fields = lines
+        .lines()
+        .map(|line| line.split('|').collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    assert_eq!(fields.len(), 5);
+    assert_eq!(fields[0][0], "start");
+    assert_eq!(
+        Path::new(fields[0][1]).canonicalize().unwrap(),
+        main_path(&managed).join("scripts").canonicalize().unwrap()
+    );
+    assert_eq!(fields[0][2], "main");
+    assert!(!fields[0][3].is_empty());
+    assert_eq!(
+        fields[0][4],
+        state["allocations"]["main"]["ports"]["postgres"].to_string()
+    );
+    assert_eq!(
+        fields[0][5],
+        state["allocations"]["main"]["ports"]["redis"].to_string()
+    );
+    assert_eq!(fields[1][0], "status");
+    assert_eq!(
+        Path::new(fields[1][1]).canonicalize().unwrap(),
+        worktree_path(&managed, "feature")
+            .join("scripts")
+            .canonicalize()
+            .unwrap()
+    );
+    assert_eq!(fields[1][2], "feature");
+    assert_ne!(fields[1][3], fields[0][3]);
+    assert_eq!(
+        fields[1][4],
+        state["allocations"]["feature"]["ports"]["postgres"].to_string()
+    );
+    assert_eq!(
+        fields[1][5],
+        state["allocations"]["feature"]["ports"]["redis"].to_string()
+    );
+    assert_eq!(fields[2][0], "stop");
+    assert_eq!(fields[3][0], "stop");
+    assert_eq!(fields[4][0], "stop");
+    assert_eq!(fields[4][2], "start");
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_start_preflight_and_config_boundaries_block_execution() {
+    let source = runtime_source();
+    let bin = TempDir::new().unwrap();
+    write_mock_docker(bin.path());
+    let managed = init_compose_managed(&source, bin.path());
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+    let runtime_log = bin.path().join("runtime.log");
+    let docker_log = bin.path().join("docker.log");
+    let state_path = managed.path().join(".git/.wrt/state.json");
+    let state_before = fs::read(&state_path).unwrap();
+
+    for mode in ["blocked", "fail"] {
+        wrt_cmd()
+            .current_dir(main_path(&managed))
+            .env("PATH", &path)
+            .env("RUNTIME_LOG", &runtime_log)
+            .env("MOCK_DOCKER_LOG", &docker_log)
+            .env("MOCK_DOCKER_MODE", mode)
+            .args(["runtime", "start"])
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains(
+                "Compose isolation preflight failed",
+            ));
+    }
+    assert!(!runtime_log.exists());
+
+    let config_path = main_path(&managed).join(".wrt.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    config["commands"]["start"] = serde_json::Value::Null;
+    fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let docker_before = fs::read(&docker_log).unwrap();
+
+    wrt_cmd()
+        .current_dir(main_path(&managed))
+        .env("PATH", &path)
+        .env("RUNTIME_LOG", &runtime_log)
+        .env("MOCK_DOCKER_LOG", &docker_log)
+        .args(["runtime", "start"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "project runtime start command is not declared",
+        ));
+
+    assert_eq!(fs::read(&docker_log).unwrap(), docker_before);
+    assert_eq!(fs::read(&state_path).unwrap(), state_before);
+    assert!(!runtime_log.exists());
+
+    use std::os::unix::fs::symlink;
+    let outside = TempDir::new().unwrap();
+    fs::copy(
+        main_path(&managed).join("scripts/runtime.sh"),
+        outside.path().join("runtime.sh"),
+    )
+    .unwrap();
+    fs::remove_dir_all(main_path(&managed).join("scripts")).unwrap();
+    symlink(outside.path(), main_path(&managed).join("scripts")).unwrap();
+
+    wrt_cmd()
+        .current_dir(main_path(&managed))
+        .env("PATH", &path)
+        .env("RUNTIME_LOG", &runtime_log)
+        .env("MOCK_DOCKER_LOG", &docker_log)
+        .args(["runtime", "stop"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "command cwd resolves outside the worktree",
+        ));
+
+    assert_eq!(fs::read(&docker_log).unwrap(), docker_before);
+    assert_eq!(fs::read(&state_path).unwrap(), state_before);
+    assert!(!runtime_log.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_status_and_stop_do_not_block_behind_running_start() {
+    let source = runtime_source();
+    let bin = TempDir::new().unwrap();
+    write_mock_docker(bin.path());
+    let managed = init_compose_managed(&source, bin.path());
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+    let runtime_log = bin.path().join("runtime.log");
+    let docker_log = bin.path().join("docker.log");
+    let block_file = bin.path().join("start.block");
+    let ready_file = bin.path().join("start.ready");
+    fs::write(&block_file, "hold").unwrap();
+
+    let mut start = StdCommand::new(assert_cmd::cargo::cargo_bin!("wrt"))
+        .current_dir(main_path(&managed))
+        .env("PATH", &path)
+        .env("RUNTIME_LOG", &runtime_log)
+        .env("MOCK_DOCKER_LOG", &docker_log)
+        .env("RUNTIME_START_BLOCK_FILE", &block_file)
+        .env("RUNTIME_START_READY_FILE", &ready_file)
+        .args(["runtime", "start"])
+        .spawn()
+        .unwrap();
+
+    for _ in 0..50 {
+        if ready_file.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        ready_file.exists(),
+        "start command never reached the runtime script"
+    );
+
+    wrt_cmd()
+        .current_dir(managed.path())
+        .timeout(Duration::from_secs(2))
+        .env("PATH", &path)
+        .env("RUNTIME_LOG", &runtime_log)
+        .env("MOCK_DOCKER_LOG", &docker_log)
+        .args(["runtime", "main", "status"])
+        .assert()
+        .success();
+
+    wrt_cmd()
+        .current_dir(managed.path())
+        .timeout(Duration::from_secs(2))
+        .env("PATH", &path)
+        .env("RUNTIME_LOG", &runtime_log)
+        .env("MOCK_DOCKER_LOG", &docker_log)
+        .args(["runtime", "main", "stop"])
+        .assert()
+        .success();
+
+    fs::remove_file(&block_file).unwrap();
+    assert!(start.wait().unwrap().success());
+
+    let lines = fs::read_to_string(runtime_log).unwrap();
+    let actions = lines
+        .lines()
+        .map(|line| line.split('|').next().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(actions, vec!["start", "status", "stop"]);
 }
 
 #[test]
@@ -545,7 +1007,7 @@ fn init_print_uses_mock_output() {
     let mock = td.path().join("mock.json");
     fs::write(
         &mock,
-        r#"{"version":1,"port_block_size":100,"package_manager":{"name":"unknown","install_command":["npm","install"]},"services":[],"supabase":{"detected":false}}"#,
+        complete_v2_config(r#"{"version":2,"port_stride":100}"#),
     )
     .unwrap();
 
@@ -556,7 +1018,7 @@ fn init_print_uses_mock_output() {
 
     cmd.assert()
         .success()
-        .stdout(predicate::str::contains("\"version\": 1"));
+        .stdout(predicate::str::contains("\"version\": 2"));
 
     assert!(!main.join(".wrt.json").exists());
     assert!(!td.path().join(".wrt.json").exists());
@@ -570,7 +1032,7 @@ fn init_writes_config_and_respects_force() {
     let mock = td.path().join("mock.json");
     fs::write(
         &mock,
-        r#"{"version":1,"port_block_size":100,"package_manager":{"name":"unknown","install_command":["npm","install"]},"services":[],"supabase":{"detected":false}}"#,
+        complete_v2_config(r#"{"version":2,"port_stride":100}"#),
     )
     .unwrap();
 
@@ -585,10 +1047,9 @@ fn init_writes_config_and_respects_force() {
     assert!(out_path.exists());
     assert!(!main.join(".wrt.json").exists());
     let s = fs::read_to_string(&out_path).unwrap();
-    assert!(s.contains("\"version\": 1"));
+    assert!(s.contains("\"version\": 2"));
     assert!(s.ends_with('\n'));
 
-    // Without --force, should refuse overwrite.
     wrt_cmd()
         .current_dir(&main)
         .env("WRT_CODEX_MOCK_OUTPUT", &mock)
@@ -597,7 +1058,6 @@ fn init_writes_config_and_respects_force() {
         .code(2)
         .stderr(predicate::str::contains("already exists"));
 
-    // With --force, should overwrite.
     wrt_cmd()
         .current_dir(&main)
         .env("WRT_CODEX_MOCK_OUTPUT", &mock)
@@ -629,6 +1089,245 @@ fn init_rejects_invalid_project_config_without_writing() {
         .stderr(predicate::str::contains("setup argv must not be empty"));
 
     assert!(!td.path().join(".wrt.json").exists());
+}
+
+#[test]
+fn init_requires_separate_consent_for_generated_commands() {
+    let (_source, td) = init_managed_repo();
+    let main = main_path(&td);
+    let mock = td.path().join("commands-mock.json");
+    fs::write(
+        &mock,
+        complete_v2_config(
+            r#"{"version":2,"port_stride":100,"commands":{"setup":{"argv":["pnpm","setup"]}}}"#,
+        ),
+    )
+    .unwrap();
+
+    wrt_cmd()
+        .current_dir(&main)
+        .env("WRT_CODEX_MOCK_OUTPUT", &mock)
+        .args(["init"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--accept-commands"));
+    assert!(!td.path().join(".wrt.json").exists());
+
+    wrt_cmd()
+        .current_dir(&main)
+        .env("WRT_CODEX_MOCK_OUTPUT", &mock)
+        .args(["init", "--print"])
+        .assert()
+        .success();
+    assert!(!td.path().join(".wrt.json").exists());
+
+    wrt_cmd()
+        .current_dir(&main)
+        .env("WRT_CODEX_MOCK_OUTPUT", &mock)
+        .args(["init", "--accept-commands"])
+        .assert()
+        .success();
+    assert!(td.path().join(".wrt.json").exists());
+}
+
+#[test]
+fn init_rejects_legacy_discovery_output() {
+    let (_source, td) = init_managed_repo();
+    let mock = td.path().join("legacy-mock.json");
+    fs::write(&mock, r#"{"version":1,"port_block_size":100}"#).unwrap();
+
+    wrt_cmd()
+        .current_dir(main_path(&td))
+        .env("WRT_CODEX_MOCK_OUTPUT", &mock)
+        .args(["init", "--print"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("version 2"));
+}
+
+#[cfg(unix)]
+#[test]
+fn init_force_refuses_a_dangling_config_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let (_source, td) = init_managed_repo();
+    let mock = td.path().join("mock.json");
+    fs::write(
+        &mock,
+        complete_v2_config(r#"{"version":2,"port_stride":100}"#),
+    )
+    .unwrap();
+    symlink("missing.json", td.path().join(".wrt.json")).unwrap();
+
+    wrt_cmd()
+        .current_dir(main_path(&td))
+        .env("WRT_CODEX_MOCK_OUTPUT", &mock)
+        .args(["init", "--force"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("refusing symlink destination"));
+    assert!(
+        fs::symlink_metadata(td.path().join(".wrt.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn lifecycle_modes_reject_invalid_values_before_mutation() {
+    let source = init_repo();
+    let parent = TempDir::new().unwrap();
+    let target = parent.path().join("managed");
+
+    wrt_cmd()
+        .current_dir(parent.path())
+        .args([
+            "root",
+            "init",
+            source.path().to_str().unwrap(),
+            "--root",
+            "managed",
+            "--install",
+            "sometimes",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("invalid value"));
+    assert!(!target.exists());
+}
+
+#[test]
+fn root_init_cleans_only_its_artifacts_after_remote_config_failure() {
+    let source = init_repo();
+    fs::write(source.path().join(".wrt.json"), "not json").unwrap();
+    git(source.path(), &["add", ".wrt.json"]);
+    git(
+        source.path(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-m",
+            "invalid config",
+        ],
+    );
+    let parent = TempDir::new().unwrap();
+    let source_url = format!("file://{}", source.path().display());
+    fs::create_dir(parent.path().join("managed")).unwrap();
+
+    wrt_cmd()
+        .current_dir(parent.path())
+        .args([
+            "root",
+            "init",
+            &source_url,
+            "--root",
+            "managed",
+            "--install",
+            "false",
+            "--supabase",
+            "false",
+            "--db",
+            "false",
+        ])
+        .assert()
+        .failure();
+    assert!(parent.path().join("managed").is_dir());
+    assert!(
+        fs::read_dir(parent.path().join("managed"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+
+    fs::write(
+        source.path().join(".wrt.json"),
+        complete_v2_config(r#"{"version":2,"port_stride":100}"#),
+    )
+    .unwrap();
+    git(source.path(), &["add", ".wrt.json"]);
+    git(
+        source.path(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-m",
+            "fix config",
+        ],
+    );
+    wrt_cmd()
+        .current_dir(parent.path())
+        .args([
+            "root",
+            "init",
+            &source_url,
+            "--root",
+            "managed",
+            "--install",
+            "false",
+            "--supabase",
+            "false",
+            "--db",
+            "false",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn root_init_cleans_created_target_after_port_merge_failure() {
+    let source = init_repo();
+    fs::create_dir_all(source.path().join("supabase")).unwrap();
+    fs::write(
+        source.path().join("supabase/config.toml"),
+        "project_id = \"test\"\n[api]\nport = 5432\n",
+    )
+    .unwrap();
+    fs::write(
+        source.path().join(".wrt.json"),
+        complete_v2_config(
+            r#"{"version":2,"port_stride":100,"ports":[{"key":"postgres","base_port":5432}],"supabase":{"config_path":"supabase/config.toml"}}"#,
+        ),
+    )
+    .unwrap();
+    git(source.path(), &["add", ".wrt.json", "supabase/config.toml"]);
+    git(
+        source.path(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-m",
+            "conflicting ports",
+        ],
+    );
+    let parent = TempDir::new().unwrap();
+    let source_url = format!("file://{}", source.path().display());
+
+    wrt_cmd()
+        .current_dir(parent.path())
+        .args([
+            "root",
+            "init",
+            &source_url,
+            "--root",
+            "managed",
+            "--install",
+            "false",
+            "--db",
+            "false",
+        ])
+        .assert()
+        .failure();
+    assert!(!parent.path().join("managed").exists());
 }
 
 #[test]
@@ -765,12 +1464,10 @@ fn new_patches_supabase_and_sets_skip_worktree_when_isolated() {
     let wt_dir = worktree_path(&td, "x");
     let patched = fs::read_to_string(wt_dir.join("supabase").join("config.toml")).unwrap();
 
-    // First allocation block is 1 => offset 100.
     assert!(patched.contains("project_id = \"myproj-x\""));
     assert!(patched.contains("port = 5532"));
     assert!(patched.contains("http://localhost:3100"));
 
-    // Ensure skip-worktree is set.
     let v = git_out(&wt_dir, &["ls-files", "-v", "supabase/config.toml"]);
     assert!(v.starts_with('S'));
 
@@ -824,6 +1521,21 @@ fn root_init_status_and_new_use_sibling_worktrees() {
     assert!(managed.path().join(".wrt.json").exists());
     assert!(main.join("README.md").exists());
     assert!(main.join(".wrt.env").exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            fs::metadata(main.join(".wrt.env")).unwrap().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(managed.path().join(".wrt.json"))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
     assert_eq!(fs::read_to_string(main.join(".env")).unwrap(), "FOO=bar\n");
     assert_eq!(
         git_out(&main, &["config", "--get", "remote.origin.fetch"]).trim(),
@@ -865,7 +1577,22 @@ fn root_init_status_and_new_use_sibling_worktrees() {
         fs::read_to_string(feature.join(".env")).unwrap(),
         "FOO=bar\n"
     );
-    assert!(feature.join(".wrt.json").exists());
+    assert!(!feature.join(".wrt.json").exists());
+
+    fs::write(
+        managed.path().join(".wrt.json"),
+        complete_v2_config(
+            r#"{"version":2,"port_stride":100,"ports":[{"key":"web","base_port":3000,"outputs":[{"env":"ALT_PORT","template":"service-{port}"}]}],"commands":{"status":{"argv":["sh","status.sh"]}}}"#,
+        ),
+    )
+    .unwrap();
+    wrt_cmd()
+        .current_dir(&feature)
+        .args(["env"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("export ALT_PORT='service-3100'"))
+        .stdout(predicate::str::contains("export PORT=").not());
 
     wrt_cmd()
         .current_dir(&feature)
@@ -881,10 +1608,7 @@ fn root_init_status_and_new_use_sibling_worktrees() {
             "export WRT_MAIN_PATH='{}'",
             main.display()
         )))
-        .stdout(predicate::str::contains("export PORT='3100'"))
-        .stdout(predicate::str::contains(
-            "export APP_URL='http://localhost:3100'",
-        ));
+        .stdout(predicate::str::contains("export ALT_PORT='service-3100'"));
 }
 
 #[test]
@@ -1070,7 +1794,6 @@ fn non_main_primary_owns_supabase_even_when_feature_is_named_main() {
         "staging"
     );
 
-    // Compatibility with state written before primary owners used their actual allocation key.
     state["allocations"]["feature-shared"]["supabase"]["owner"] =
         serde_json::Value::String("main".to_string());
     fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
@@ -1699,6 +2422,77 @@ fn new_concurrent_processes_reserve_disjoint_port_sets() {
     assert_eq!(state["allocations"].as_object().unwrap().len(), 3);
 }
 
+#[cfg(unix)]
+#[test]
+fn concurrent_new_processes_preserve_git_worktree_metadata() {
+    let (_source, managed) = init_managed_repo();
+    let binary = assert_cmd::cargo::cargo_bin!("wrt");
+    let names = (0..8)
+        .map(|index| format!("metadata-{index}"))
+        .collect::<Vec<_>>();
+    let children = names
+        .iter()
+        .map(|name| {
+            StdCommand::new(binary)
+                .current_dir(managed.path())
+                .args([
+                    "new",
+                    name,
+                    "--install",
+                    "false",
+                    "--supabase",
+                    "none",
+                    "--db",
+                    "false",
+                ])
+                .spawn()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    for (name, child) in names.iter().zip(children) {
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "wrt new {name} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let listing = StdCommand::new("git")
+        .args([
+            "--git-dir",
+            managed.path().join(".git").to_str().unwrap(),
+            "worktree",
+            "list",
+            "--porcelain",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        listing.status.success(),
+        "git worktree list failed: {}",
+        String::from_utf8_lossy(&listing.stderr)
+    );
+    let listing = String::from_utf8(listing.stdout).unwrap();
+    let managed_path = managed.path().canonicalize().unwrap();
+    for name in &names {
+        assert!(
+            listing.contains(&format!("worktree {}\n", managed_path.join(name).display())),
+            "missing {name} worktree metadata:\n{listing}"
+        );
+        assert!(
+            listing.contains(&format!("branch refs/heads/{name}\n")),
+            "missing {name} branch metadata:\n{listing}"
+        );
+    }
+
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(managed.path().join(".git/.wrt/state.json")).unwrap())
+            .unwrap();
+    assert_eq!(state["allocations"].as_object().unwrap().len(), 9);
+}
+
 #[test]
 fn new_removes_checkout_after_config_or_reservation_failure() {
     let (_source, managed) = init_managed_repo();
@@ -1782,12 +2576,14 @@ fn concurrent_shared_new_processes_converge_on_main_supabase_ownership() {
     write_mock_supabase(bin.path());
     let path = format!("{}:/usr/bin:/bin", bin.path().display());
     let binary = assert_cmd::cargo::cargo_bin!("wrt");
+    let start_lock = managed.path().join("supabase-start.lock");
 
     let spawn = |name: &str| {
         StdCommand::new(binary)
             .current_dir(managed.path())
             .env("PATH", &path)
             .env("MOCK_LOG", &log)
+            .env("MOCK_START_LOCK_DIR", &start_lock)
             .args([
                 "new",
                 name,
@@ -1833,6 +2629,8 @@ fn concurrent_shared_new_processes_converge_on_main_supabase_ownership() {
         state["allocations"]["main"]["ports"]["supabase.api.port"],
         54321
     );
+    let log = fs::read_to_string(log).unwrap();
+    assert_eq!(log.matches("supabase start").count(), 1, "{log}");
 }
 
 #[cfg(unix)]
@@ -2132,13 +2930,12 @@ done
 printf '%s\n' "$PWD" > "$CODEX_PWD_LOG"
 cat > "$out" <<'JSON'
 {
-  "version": 1,
-  "port_block_size": 100,
-  "package_manager": { "name": "unknown", "install_command": [], "notes": null },
-  "services": [],
-  "database": { "detected": false, "kind": null, "migrate_command": null, "seed_command": null, "reset_command": null, "notes": null },
-  "supabase": { "detected": false, "config_path": null, "start_command": null, "base_ports": null, "notes": null },
-  "notes": null
+  "version": 2,
+  "port_stride": 100,
+  "ports": [],
+  "commands": { "setup": null, "start": null, "stop": null, "status": null, "db_migrate": null, "db_seed": null, "db_reset": null },
+  "compose": null,
+  "supabase": null
 }
 JSON
 "#,
@@ -2500,6 +3297,7 @@ fn db_reset_requires_yes_non_interactive_and_runs_with_yes() {
   "supabase": { "detected": false, "config_path": null, "start_command": null, "base_ports": null, "notes": null },
   "notes": null
 }
+
 "#,
     )
     .unwrap();
@@ -2522,6 +3320,13 @@ fn db_reset_requires_yes_non_interactive_and_runs_with_yes() {
 
     let wt_dir = worktree_path(&td, "x");
 
+    wrt_cmd()
+        .current_dir(td.path())
+        .args(["db", "x", "reset", "--print"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("'sh' '-c' 'echo ran > .db_ran'"));
+
     // Non-interactive test: must refuse without --yes.
     let mut cmd = wrt_cmd();
     cmd.current_dir(td.path()).args(["db", "x", "reset"]);
@@ -2538,6 +3343,191 @@ fn db_reset_requires_yes_non_interactive_and_runs_with_yes() {
     set_minimal_path(&mut cmd);
     cmd.assert().success();
     assert!(wt_dir.join(".db_ran").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn db_reset_holds_the_allocation_lifecycle_against_remove() {
+    let source = init_repo();
+    fs::create_dir_all(source.path().join("scripts")).unwrap();
+    fs::write(
+        source.path().join("scripts/reset.sh"),
+        "#!/bin/sh\nset -eu\n: > \"$DB_READY\"\nwhile [ -f \"$DB_BLOCK\" ]; do sleep 0.05; done\n",
+    )
+    .unwrap();
+    fs::write(
+        source.path().join(".wrt.json"),
+        complete_v2_config(
+            r#"{"version":2,"port_stride":100,"commands":{"db_reset":{"argv":["sh","scripts/reset.sh"]}}}"#,
+        ),
+    )
+    .unwrap();
+    git(source.path(), &["add", ".wrt.json", "scripts/reset.sh"]);
+    git(
+        source.path(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-m",
+            "add blocking reset",
+        ],
+    );
+    let (_source, managed) = init_managed_from(source);
+    wrt_cmd()
+        .current_dir(managed.path())
+        .args([
+            "new",
+            "database-race",
+            "--install",
+            "false",
+            "--supabase",
+            "false",
+            "--db",
+            "false",
+        ])
+        .assert()
+        .success();
+    let block = managed.path().join("db.block");
+    let ready = managed.path().join("db.ready");
+    fs::write(&block, "hold").unwrap();
+
+    let mut reset = StdCommand::new(assert_cmd::cargo::cargo_bin!("wrt"))
+        .current_dir(managed.path())
+        .env("DB_BLOCK", &block)
+        .env("DB_READY", &ready)
+        .args(["db", "database-race", "reset", "--yes"])
+        .spawn()
+        .unwrap();
+    for _ in 0..100 {
+        if ready.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(ready.exists());
+
+    let mut remove = StdCommand::new(assert_cmd::cargo::cargo_bin!("wrt"))
+        .current_dir(managed.path())
+        .args(["rm", "database-race", "--force"])
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(150));
+    assert!(remove.try_wait().unwrap().is_none());
+
+    fs::remove_file(block).unwrap();
+    assert!(reset.wait().unwrap().success());
+    assert!(remove.wait().unwrap().success());
+}
+
+#[cfg(unix)]
+#[test]
+fn shared_database_commands_serialize_on_the_owner_lifecycle() {
+    let source = init_repo();
+    fs::create_dir_all(source.path().join("scripts")).unwrap();
+    fs::write(
+        source.path().join("scripts/reset.sh"),
+        "#!/bin/sh\nset -eu\n: > \"$DB_READY\"\nwhile [ -f \"$DB_BLOCK\" ]; do sleep 0.05; done\n",
+    )
+    .unwrap();
+    fs::write(
+        source.path().join(".wrt.json"),
+        complete_v2_config(
+            r#"{"version":2,"port_stride":100,"commands":{"db_reset":{"argv":["sh","scripts/reset.sh"]}}}"#,
+        ),
+    )
+    .unwrap();
+    git(source.path(), &["add", ".wrt.json", "scripts/reset.sh"]);
+    git(
+        source.path(),
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-m",
+            "add blocking reset",
+        ],
+    );
+    let (_source, managed) = init_managed_from(source);
+    wrt_cmd()
+        .current_dir(managed.path())
+        .args([
+            "new",
+            "shared-client",
+            "--install",
+            "false",
+            "--supabase",
+            "false",
+            "--db",
+            "false",
+        ])
+        .assert()
+        .success();
+
+    let state_path = managed.path().join(".git/.wrt/state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    state["allocations"]["main"]["supabase"] = serde_json::json!({
+        "mode": "owned",
+        "projectId": "shared-main",
+        "configPath": "supabase/config.toml"
+    });
+    state["allocations"]["shared-client"]["supabase"] =
+        serde_json::json!({"mode": "shared", "owner": "main"});
+    fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+    let owner_workdir = main_path(&managed);
+    fs::create_dir_all(owner_workdir.join("supabase")).unwrap();
+    fs::write(owner_workdir.join(".mock_supabase_started"), "").unwrap();
+    let mock_bin = managed.path().join("mock-bin");
+    fs::create_dir(&mock_bin).unwrap();
+    write_mock_supabase(&mock_bin);
+    let mock_log = managed.path().join("supabase.log");
+    let path = format!("{}:/usr/bin:/bin", mock_bin.display());
+    let first_block = managed.path().join("first.block");
+    let first_ready = managed.path().join("first.ready");
+    let second_block = managed.path().join("second.block");
+    let second_ready = managed.path().join("second.ready");
+    fs::write(&first_block, "hold").unwrap();
+
+    let mut first = StdCommand::new(assert_cmd::cargo::cargo_bin!("wrt"))
+        .current_dir(managed.path())
+        .env("PATH", &path)
+        .env("MOCK_LOG", &mock_log)
+        .env("DB_BLOCK", &first_block)
+        .env("DB_READY", &first_ready)
+        .args(["db", "shared-client", "reset", "--yes"])
+        .spawn()
+        .unwrap();
+    for _ in 0..100 {
+        if first_ready.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(first_ready.exists());
+
+    let mut second = StdCommand::new(assert_cmd::cargo::cargo_bin!("wrt"))
+        .current_dir(managed.path())
+        .env("PATH", &path)
+        .env("MOCK_LOG", &mock_log)
+        .env("DB_BLOCK", &second_block)
+        .env("DB_READY", &second_ready)
+        .args(["db", "main", "reset", "--yes"])
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(150));
+    assert!(!second_ready.exists());
+    assert!(second.try_wait().unwrap().is_none());
+
+    fs::remove_file(first_block).unwrap();
+    assert!(first.wait().unwrap().success());
+    assert!(second.wait().unwrap().success());
+    assert!(second_ready.exists());
 }
 
 #[test]

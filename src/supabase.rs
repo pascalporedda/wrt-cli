@@ -8,6 +8,7 @@ use toml_edit::{DocumentMut, InlineTable, Item, Table, Value, value};
 use crate::project::PortKey;
 use crate::project::ProjectConfig;
 use crate::state::{Allocation, PortAssignments, State, SupabaseAllocation};
+use crate::util::{atomic_write_private, validate_write_target};
 
 pub const DEFAULT_CONFIG_PATH: &str = "supabase/config.toml";
 
@@ -294,6 +295,7 @@ pub fn patch_config(
     offset: i32,
 ) -> Result<()> {
     let p = target.absolute_config_path(worktree_root);
+    validate_write_target(worktree_root, &p)?;
     let b = fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
     let mut doc = b
         .parse::<DocumentMut>()
@@ -324,7 +326,7 @@ pub fn patch_config(
         out.push('\n');
     }
 
-    fs::write(&p, out.as_bytes()).with_context(|| format!("write {}", p.display()))?;
+    atomic_write_private(worktree_root, &p, out.as_bytes())?;
     Ok(())
 }
 
@@ -336,6 +338,7 @@ pub fn patch_config_to_claims(
     allocation_ports: &PortAssignments,
 ) -> Result<()> {
     let path = target.absolute_config_path(worktree_root);
+    validate_write_target(worktree_root, &path)?;
     let input = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let mut document = input
         .parse::<DocumentMut>()
@@ -375,7 +378,7 @@ pub fn patch_config_to_claims(
     if !output.ends_with('\n') {
         output.push('\n');
     }
-    fs::write(&path, output).with_context(|| format!("write {}", path.display()))
+    atomic_write_private(worktree_root, &path, output.as_bytes())
 }
 
 fn patch_exact_claims(

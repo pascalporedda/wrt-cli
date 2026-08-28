@@ -9,6 +9,7 @@ mod prune;
 mod rm;
 mod root;
 mod run;
+mod runtime;
 mod setup;
 
 pub use db::cmd_db;
@@ -22,4 +23,5 @@ pub use prune::cmd_prune;
 pub use rm::cmd_rm;
 pub use root::{CloneOpts, RootInitOpts, cmd_clone, cmd_root_init, cmd_root_status};
 pub use run::{cmd_run, raw_run_has_sep};
+pub use runtime::cmd_runtime;
 pub use setup::cmd_setup;

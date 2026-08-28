@@ -128,17 +128,47 @@ impl CommandSpec {
         &self.argv
     }
 
-    pub fn working_dir(&self, worktree_root: &Path) -> PathBuf {
-        self.cwd.as_ref().map_or_else(
-            || worktree_root.to_path_buf(),
-            |path| worktree_root.join(&path.0),
-        )
+    pub fn cwd(&self) -> Option<&Path> {
+        self.cwd.as_ref().map(|path| path.0.as_path())
+    }
+
+    pub fn working_dir(&self, worktree_root: &Path) -> Result<PathBuf> {
+        let root = fs::canonicalize(worktree_root)
+            .with_context(|| format!("resolve worktree root {}", worktree_root.display()))?;
+        let target = self
+            .cwd
+            .as_ref()
+            .map_or_else(|| root.clone(), |path| root.join(&path.0));
+        let resolved = fs::canonicalize(&target)
+            .with_context(|| format!("resolve command cwd {}", target.display()))?;
+        if !resolved.starts_with(&root) {
+            bail!(
+                "command cwd resolves outside the worktree: {}",
+                target.display()
+            );
+        }
+        if !resolved.is_dir() {
+            bail!("command cwd is not a directory: {}", target.display());
+        }
+        Ok(resolved)
     }
 }
 
 impl ProjectCommands {
     pub fn setup(&self) -> Option<&CommandSpec> {
         self.setup.as_ref()
+    }
+
+    pub fn start(&self) -> Option<&CommandSpec> {
+        self.start.as_ref()
+    }
+
+    pub fn stop(&self) -> Option<&CommandSpec> {
+        self.stop.as_ref()
+    }
+
+    pub fn status(&self) -> Option<&CommandSpec> {
+        self.status.as_ref()
     }
 
     pub fn db_migrate(&self) -> Option<&CommandSpec> {
@@ -187,6 +217,19 @@ impl ProjectConfig {
         }
     }
 
+    pub fn from_discovery_slice(input: &[u8]) -> Result<Self> {
+        let value: serde_json::Value =
+            serde_json::from_slice(input).context("parse discovery JSON")?;
+        if value.get("version").and_then(serde_json::Value::as_u64) != Some(2) {
+            bail!("discovery output must use project config version 2");
+        }
+        let config = normalize_v2(
+            serde_json::from_slice(input).context("parse version 2 discovery output")?,
+        )?;
+        config.validate_discovered_commands()?;
+        Ok(config)
+    }
+
     pub fn load_optional(path: &Path) -> Result<Option<Self>> {
         match fs::read(path) {
             Ok(input) => Self::from_slice(&input)
@@ -199,8 +242,15 @@ impl ProjectConfig {
 
     pub fn load_for(config_root: &Path, checkout_root: &Path) -> Result<Option<Self>> {
         let local = checkout_root.join(".wrt.json");
-        if let Some(config) = Self::load_optional(&local)? {
-            return Ok(Some(config));
+        match fs::symlink_metadata(&local) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!("invalid {}: symlinks are not allowed", local.display())
+            }
+            Ok(_) => return Self::load_optional(&local),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect {}", local.display()));
+            }
         }
 
         let fallback = config_root.join(".wrt.json");
@@ -260,6 +310,140 @@ impl ProjectConfig {
             )?;
         }
         Ok(())
+    }
+
+    pub fn discovered_commands(&self) -> Vec<(&'static str, &CommandSpec)> {
+        [
+            ("setup", self.commands.setup()),
+            ("start", self.commands.start()),
+            ("stop", self.commands.stop()),
+            ("status", self.commands.status()),
+            ("db_migrate", self.commands.db_migrate()),
+            ("db_seed", self.commands.db_seed()),
+            ("db_reset", self.commands.db_reset()),
+        ]
+        .into_iter()
+        .filter_map(|(name, command)| command.map(|command| (name, command)))
+        .collect()
+    }
+
+    fn validate_discovered_commands(&self) -> Result<()> {
+        for (name, command) in self.discovered_commands() {
+            let (executable, arguments) = unwrap_discovery_command(&command.argv)
+                .with_context(|| format!("invalid discovered {name} command wrapper"))?;
+            if uses_command_string(&executable, arguments) {
+                bail!("discovered {name} command must not use a shell command-string wrapper");
+            }
+            if name == "setup"
+                && (matches!(executable.as_str(), "rm" | "rmdir" | "truncate")
+                    || arguments
+                        .iter()
+                        .any(|argument| is_destructive_setup_alias(argument)))
+            {
+                bail!(
+                    "discovered setup command looks destructive; setup must not reset or delete data"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn unwrap_discovery_command(argv: &[String]) -> Result<(String, &[String])> {
+    let mut executable = argv
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("command argv must not be empty"))?;
+    let mut arguments = &argv[1..];
+    loop {
+        if Path::new(executable).is_absolute() {
+            bail!("executable must be repository-portable, not absolute");
+        }
+        let normalized = normalized_executable(executable);
+        match normalized.as_str() {
+            "env" => {
+                let mut index = 0;
+                if arguments.first().is_some_and(|argument| argument == "--") {
+                    index = 1;
+                }
+                while arguments.get(index).is_some_and(|argument| {
+                    argument
+                        .split_once('=')
+                        .is_some_and(|(key, _)| is_environment_name(key))
+                }) {
+                    index += 1;
+                }
+                if arguments
+                    .get(index)
+                    .is_some_and(|argument| argument.starts_with('-'))
+                {
+                    bail!("unsupported env wrapper option");
+                }
+                executable = arguments
+                    .get(index)
+                    .ok_or_else(|| anyhow::anyhow!("env wrapper has no executable"))?;
+                arguments = &arguments[index + 1..];
+            }
+            "busybox" => {
+                let mut index = 0;
+                if arguments.first().is_some_and(|argument| argument == "--") {
+                    index = 1;
+                } else if arguments
+                    .first()
+                    .is_some_and(|argument| argument.starts_with('-'))
+                {
+                    bail!("unsupported busybox wrapper option");
+                }
+                executable = arguments
+                    .get(index)
+                    .ok_or_else(|| anyhow::anyhow!("busybox wrapper has no applet"))?;
+                arguments = &arguments[index + 1..];
+            }
+            _ => return Ok((normalized, arguments)),
+        }
+    }
+}
+
+fn normalized_executable(executable: &str) -> String {
+    let name = Path::new(executable)
+        .file_name()
+        .and_then(|part| part.to_str())
+        .unwrap_or(executable)
+        .to_ascii_lowercase();
+    name.strip_suffix(".exe").unwrap_or(&name).to_string()
+}
+
+fn is_environment_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn uses_command_string(executable: &str, arguments: &[String]) -> bool {
+    match executable {
+        "sh" | "ash" | "bash" | "csh" | "dash" | "fish" | "ksh" | "mksh" | "tcsh" | "yash"
+        | "zsh" => arguments.iter().any(|argument| {
+            let lower = argument.to_ascii_lowercase();
+            lower == "--command"
+                || lower.starts_with("--command=")
+                || lower
+                    .strip_prefix('-')
+                    .filter(|flags| !flags.starts_with('-'))
+                    .is_some_and(|flags| flags.contains('c'))
+        }),
+        "pwsh" | "powershell" => arguments.iter().any(|argument| {
+            let flag = argument.trim_start_matches(['-', '/']).to_ascii_lowercase();
+            let flag = flag.split([':', '=']).next().unwrap_or(&flag);
+            ["command", "commandwithargs", "encodedcommand"]
+                .iter()
+                .any(|parameter| !flag.is_empty() && parameter.starts_with(flag))
+        }),
+        "cmd" => arguments.iter().any(|argument| {
+            let flag = argument.to_ascii_lowercase();
+            flag.starts_with("/c") || flag.starts_with("/k")
+        }),
+        _ => false,
     }
 }
 
@@ -723,7 +907,23 @@ fn validate_argv(argv: Vec<String>, label: &str) -> Result<Vec<String>> {
     if argv.iter().any(|item| item.trim().is_empty()) {
         bail!("{label} argv items must not be empty");
     }
+    if argv
+        .iter()
+        .any(|item| item.chars().any(|character| character.is_control()))
+    {
+        bail!("{label} argv items must not contain control characters");
+    }
     Ok(argv)
+}
+
+fn is_destructive_setup_alias(argument: &str) -> bool {
+    let normalized = argument.to_ascii_lowercase();
+    normalized.split([':', '-', '/']).any(|part| {
+        matches!(
+            part,
+            "reset" | "clean" | "destroy" | "drop" | "delete" | "prune"
+        )
+    })
 }
 
 fn validate_stride(stride: i32) -> Result<u16> {
@@ -1166,5 +1366,60 @@ mod tests {
 
         let error = ProjectConfig::load_for(root.path(), &checkout).unwrap_err();
         assert!(error.to_string().contains("checkout/.wrt.json"));
+    }
+
+    #[test]
+    fn discovery_accepts_only_v2_and_rejects_unsafe_generated_commands() {
+        let legacy = br#"{"version":1,"port_block_size":100}"#;
+        assert!(ProjectConfig::from_discovery_slice(legacy).is_err());
+
+        for input in [
+            r#"{"version":2,"port_stride":100,"commands":{"setup":{"argv":["sh","-c","echo pwned"]}}}"#,
+            r#"{"version":2,"port_stride":100,"commands":{"setup":{"argv":["bash","-lc","echo pwned"]}}}"#,
+            r#"{"version":2,"port_stride":100,"commands":{"setup":{"argv":["zsh","-ec","echo pwned"]}}}"#,
+            r#"{"version":2,"port_stride":100,"commands":{"setup":{"argv":["dash","-c","echo pwned"]}}}"#,
+            r#"{"version":2,"port_stride":100,"commands":{"setup":{"argv":["ksh","-lc","echo pwned"]}}}"#,
+            r#"{"version":2,"port_stride":100,"commands":{"setup":{"argv":["PowerShell","-Co","Write-Host pwned"]}}}"#,
+            r#"{"version":2,"port_stride":100,"commands":{"setup":{"argv":["pwsh","-ENC","ZQBjAGgAbwA="]}}}"#,
+            r#"{"version":2,"port_stride":100,"commands":{"setup":{"argv":["env","sh","-c","echo pwned"]}}}"#,
+            r#"{"version":2,"port_stride":100,"commands":{"setup":{"argv":["env","dash","-c","echo pwned"]}}}"#,
+            r#"{"version":2,"port_stride":100,"commands":{"setup":{"argv":["env","SAFE=1","rm","-r","build"]}}}"#,
+            r#"{"version":2,"port_stride":100,"commands":{"setup":{"argv":["busybox","sh","-c","echo pwned"]}}}"#,
+            r#"{"version":2,"port_stride":100,"commands":{"setup":{"argv":["busybox","ash","-c","echo pwned"]}}}"#,
+            r#"{"version":2,"port_stride":100,"commands":{"setup":{"argv":["busybox","rm","-r","build"]}}}"#,
+            r#"{"version":2,"port_stride":100,"commands":{"setup":{"argv":["PowerShell.exe","-Command","Write-Host pwned"]}}}"#,
+            r#"{"version":2,"port_stride":100,"commands":{"setup":{"argv":["cmd.exe","/c","echo pwned"]}}}"#,
+            r#"{"version":2,"port_stride":100,"commands":{"setup":{"argv":["cmd.exe","/kstart","echo pwned"]}}}"#,
+            r#"{"version":2,"port_stride":100,"commands":{"start":{"argv":["/usr/bin/pnpm","start"]}}}"#,
+            r#"{"version":2,"port_stride":100,"commands":{"setup":{"argv":["pnpm","db:reset"]}}}"#,
+            r#"{"version":2,"port_stride":100,"commands":{"setup":{"argv":["rm","-r","build"]}}}"#,
+            r#"{"version":2,"port_stride":100,"commands":{"setup":{"argv":["rmdir","build"]}}}"#,
+            r#"{"version":2,"port_stride":100,"commands":{"setup":{"argv":["truncate","-s","0","db"]}}}"#,
+        ] {
+            let input = complete_v2_fixture(input);
+            assert!(ProjectConfig::from_discovery_slice(&input).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_local_config_is_invalid_and_never_falls_back() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let checkout = root.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        fs::write(
+            root.path().join(".wrt.json"),
+            complete_v2_fixture(r#"{"version":2,"port_stride":100}"#),
+        )
+        .unwrap();
+        symlink("missing.json", checkout.join(".wrt.json")).unwrap();
+
+        let error = ProjectConfig::load_for(root.path(), &checkout).unwrap_err();
+        assert!(
+            error.to_string().contains("symlinks are not allowed"),
+            "{error}"
+        );
     }
 }

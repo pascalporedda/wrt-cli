@@ -1,5 +1,5 @@
 #[path = "support/compose_project.rs"]
-mod compose_project;
+pub mod compose_project;
 
 use compose_project::{ComposeIsolation, ComposeProjectFixture};
 use serde_json::Value;
@@ -48,7 +48,9 @@ fn fixture_contains_the_eln_shaped_project_contract() {
     assert_eq!(fixture.expected_ports["postgres"], 5432);
     assert_eq!(fixture.expected_ports["redis"], 6379);
     assert_eq!(fixture.expected_ports["core-api"], 3000);
+    assert_eq!(fixture.expected_ports["source-http"], 8000);
     assert_eq!(fixture.expected_ports["web"], 5173);
+    assert!(fixture.path().join("scripts/source-http.py").is_file());
     assert_eq!(
         fixture.command_log_path,
         fixture.path().join(".wrt-command.log")
@@ -84,6 +86,7 @@ fn setup_script_records_the_environment_contract() {
         .env("POSTGRES_PORT", "15432")
         .env("REDIS_PORT", "16379")
         .env("CORE_API_PORT", "13000")
+        .env("SOURCE_HTTP_PORT", "18000")
         .env("WEB_PORT", "15173")
         .env("DATABASE_URL", "postgresql://localhost:15432/core")
         .env("AUTH_DATABASE_URL", "postgresql://localhost:15432/auth")
@@ -98,7 +101,7 @@ fn setup_script_records_the_environment_contract() {
     assert!(status.success());
     assert_eq!(
         fs::read_to_string(&fixture.command_log_path).expect("read fixture command log"),
-        "setup\twrt-feature\t15432\t16379\t13000\t15173\tpostgresql://localhost:15432/core\tpostgresql://localhost:15432/auth\tpostgresql://localhost:15432/notification\thttp://localhost:13000/api/v1\n"
+        "setup\twrt-feature\t15432\t16379\t13000\t15173\tpostgresql://localhost:15432/core\tpostgresql://localhost:15432/auth\tpostgresql://localhost:15432/notification\thttp://localhost:13000/api/v1\t18000\n"
     );
 }
 
@@ -146,7 +149,7 @@ fn wrt_preflight_checks_real_fixture_variants_when_available() {
     }
 
     let safe = ComposeProjectFixture::new(ComposeIsolation::Safe);
-    initialize_fixture_repo(&safe);
+    safe.initialize_repo();
     let safe_root = tempfile::TempDir::new().expect("create safe managed root");
     let safe_output = run_root_init(&safe, safe_root.path());
     assert!(
@@ -157,7 +160,7 @@ fn wrt_preflight_checks_real_fixture_variants_when_available() {
     assert!(safe_root.path().join("main/.wrt-command.log").is_file());
 
     let blocked = ComposeProjectFixture::new(ComposeIsolation::Blocked);
-    initialize_fixture_repo(&blocked);
+    blocked.initialize_repo();
     let blocked_root = tempfile::TempDir::new().expect("create blocked managed root");
     let blocked_output = run_root_init(&blocked, blocked_root.path());
     assert_eq!(blocked_output.status.code(), Some(1));
@@ -168,33 +171,6 @@ fn wrt_preflight_checks_real_fixture_variants_when_available() {
     assert!(stderr.contains("fixed-container-name"), "{stderr}");
     assert!(stderr.contains("eln-postgres"), "{stderr}");
     assert!(!blocked_root.path().join("main/.wrt-command.log").exists());
-}
-
-fn initialize_fixture_repo(fixture: &ComposeProjectFixture) {
-    fs::write(fixture.path().join(".wrt.json"), fixture_config()).expect("write fixture config");
-    run_git(fixture.path(), &["init", "-b", "main"]);
-    run_git(fixture.path(), &["add", "."]);
-    run_git(
-        fixture.path(),
-        &[
-            "-c",
-            "user.email=test@example.com",
-            "-c",
-            "user.name=test",
-            "commit",
-            "-m",
-            "fixture",
-        ],
-    );
-}
-
-fn run_git(dir: &std::path::Path, args: &[&str]) {
-    let status = Command::new("git")
-        .current_dir(dir)
-        .args(args)
-        .status()
-        .expect("run git");
-    assert!(status.success());
 }
 
 fn run_root_init(fixture: &ComposeProjectFixture, root: &std::path::Path) -> std::process::Output {
@@ -217,31 +193,6 @@ fn run_root_init(fixture: &ComposeProjectFixture, root: &std::path::Path) -> std
         .expect("run wrt root init")
 }
 
-fn fixture_config() -> &'static str {
-    r#"{
-  "version": 2,
-  "port_stride": 100,
-  "ports": [
-    {"key":"postgres","base_port":5432,"outputs":[
-      {"env":"POSTGRES_PORT","template":"{port}"},
-      {"env":"DATABASE_URL","template":"postgresql://postgres:postgres@localhost:{port}/core"},
-      {"env":"AUTH_DATABASE_URL","template":"postgresql://postgres:postgres@localhost:{port}/auth"},
-      {"env":"NOTIFICATION_DATABASE_URL","template":"postgresql://postgres:postgres@localhost:{port}/notification"}
-    ]},
-    {"key":"redis","base_port":6379,"outputs":[{"env":"REDIS_PORT","template":"{port}"},{"env":"REDIS_URL","template":"redis://localhost:{port}"}]},
-    {"key":"core-api","base_port":3000,"outputs":[{"env":"CORE_API_PORT","template":"{port}"},{"env":"VITE_API_URL","template":"http://localhost:{port}/api/v1"}]},
-    {"key":"web","base_port":5173,"outputs":[{"env":"WEB_PORT","template":"{port}"}]}
-  ],
-  "commands": {
-    "setup":{"argv":["sh","scripts/project-command.sh","setup"],"cwd":null},
-    "start":null,"stop":null,"status":null,"db_migrate":null,"db_seed":null,"db_reset":null
-  },
-  "compose":{"files":["compose.yaml"]},
-  "supabase":null
-}
-"#
-}
-
 fn docker_compose_is_available() -> bool {
     Command::new("docker")
         .args(["compose", "version"])
@@ -254,6 +205,7 @@ fn render_compose_config(fixture: &ComposeProjectFixture, project_name: &str) ->
         .current_dir(fixture.path())
         .args(["compose", "config", "--format", "json"])
         .env("COMPOSE_PROJECT_NAME", project_name)
+        .env("WRT_NAME", project_name)
         .env("POSTGRES_PORT", "15432")
         .env("REDIS_PORT", "16379")
         .env("CORE_API_PORT", "13000")
